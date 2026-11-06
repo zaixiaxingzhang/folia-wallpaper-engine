@@ -1,0 +1,5 @@
+*.zip
+node_modules/
+folium.sig.json
+.DS_Store
+Thumbs.db

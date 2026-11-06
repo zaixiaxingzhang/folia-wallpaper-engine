@@ -1,0 +1,24 @@
+第三方组件 / Third-party components
+==================================
+
+本模组分发了一个第三方库，用于实时渲染 Wallpaper Engine 的场景壁纸。
+This mod redistributes one third-party library, used to render Wallpaper Engine
+scene wallpapers in real time.
+
+webwallgl
+---------
+文件 / Files:      vendor/webwallgl.global.min.js
+项目 / Project:    https://github.com/oneincase/webwallgl
+版本 / Version:    3.0.0（UMD 构建 / UMD build）
+作者 / Author:     oneincase <462534624@qq.com>
+许可 / License:    MIT
+许可证原文 / Full license text: vendor/LICENSE-webwallgl.txt
+
+用途：解析 scene.pkg 并用 WebGL 逐帧渲染场景壁纸（贴图、粒子、着色器、视差、
+SceneScript）。模组只调用其公开 API，未修改其源码。
+Purpose: parse scene.pkg and render scene wallpapers frame by frame with WebGL
+(textures, particles, shaders, parallax, SceneScript). The mod only calls its
+public API and does not modify its source.
+
+其余代码为本模组原创，以 MIT 许可发布，见 LICENSE。
+All other code is original to this mod and released under the MIT license; see LICENSE.
