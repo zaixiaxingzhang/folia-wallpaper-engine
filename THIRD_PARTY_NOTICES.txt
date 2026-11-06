@@ -20,5 +20,43 @@ Purpose: parse scene.pkg and render scene wallpapers frame by frame with WebGL
 (textures, particles, shaders, parallax, SceneScript). The mod only calls its
 public API and does not modify its source.
 
+本地修改 / Local modifications
+-----------------------------
+vendor/webwallgl.global.min.js 相对上游 v3.0.0 有一处 6 行补丁：
+场景的平行光（light: "ldirectional"）在取颜色与强度时，上游直接对
+`{user, value}` / `{script}` 这类绑定对象做 String() / Number()，得到 NaN → 0，
+等于把太阳光完全关掉，依赖日光的三维场景会只剩环境光（典型表现是整屏发蓝）。
+本模组在取色前解包 `.value`，强度缺省按 1 处理。
+
+One local patch to vendor/webwallgl.global.min.js vs upstream v3.0.0: scene
+directional lights (`light: "ldirectional"`) had their colour and intensity read
+with String()/Number() straight off `{user, value}` / `{script}` binding objects,
+which yields NaN → 0 and turns the sun off entirely (model scenes then show only
+the ambient colour, typically a blue cast). The patch unwraps `.value` and
+defaults a missing intensity to 1.
+
+第二处补丁（文本脚本的图层上下文）：
+文字图层的脚本里 `thisScene.getLayer(name)` 拿到的是一个只有 `text` 的简化对象，
+读 `.size` / `.origin` / `.scale` 会 undefined 后抛错，整个 `update()` 中断 ——
+典型表现是「歌名永远停在初始值」。补丁给这个对象补上零向量/单位向量的几何字段，
+让脚本至少能跑完、把文字设出去。
+
+Second patch (text-script layer context): the object returned by
+`thisScene.getLayer(name)` inside text-layer scripts only carried `text`, so reading
+`.size` / `.origin` / `.scale` yielded undefined and threw, aborting the whole
+`update()` (the usual symptom is a song title frozen at its initial value). The
+patch adds zero/unit vectors so the script can finish and set its text.
+
+第三处补丁（蓝色环境光去偏色）：
+带平行光的三维场景里，环境光（general.ambientcolor）被全额乘到画面上，而平行光补得很少，
+于是作者设的偏蓝环境光会把整屏染成蓝色（例：Sonic AKIBA Boost Run）。补丁在「蓝色明显
+强于红色」时把环境光向亮度方向拉 85%，其余场景原样保留。
+
+Third patch (blue ambient cast): in 3D scenes with a directional light the general
+ambient colour is applied at full strength while the light adds little, so a bluish
+ambient tints the whole frame (e.g. “Sonic AKIBA Boost Run”). When blue clearly
+dominates red, the ambient is pulled 85% toward its luminance; other scenes are
+left untouched.
+
 其余代码为本模组原创，以 MIT 许可发布，见 LICENSE。
 All other code is original to this mod and released under the MIT license; see LICENSE.

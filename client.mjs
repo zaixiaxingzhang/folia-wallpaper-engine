@@ -12,14 +12,27 @@ export default function activate(folium) {
     const t = (zh, en) => ({ 'zh-CN': zh, en });
 
     // 壁纸选择状态跨 mount / 设置面板共享，改完立刻互相通知，不轮询。
+    // 背景挂载与设置面板各用一组订阅：场景失败时只让面板刷新，
+    // 否则通知背景重渲染 → 再次失败 → 死循环。
     const listeners = new Set();
-    const notify = () => listeners.forEach((listener) => {
+    const panelListeners = new Set();
+    const notifyPanel = () => panelListeners.forEach((listener) => {
         try {
             listener();
         } catch (error) {
-            console.warn('[壁纸引擎] 订阅者出错', error);
+            console.warn('[壁纸引擎] 面板订阅者出错', error);
         }
     });
+    const notify = () => {
+        listeners.forEach((listener) => {
+            try {
+                listener();
+            } catch (error) {
+                console.warn('[壁纸引擎] 订阅者出错', error);
+            }
+        });
+        notifyPanel();
+    };
 
     let libraryCache = null;
     let libraryPromise = null;
@@ -94,6 +107,216 @@ export default function activate(folium) {
         return libraryPromise;
     };
 
+    // -----------------------------------------------------------------------
+    // 自定义背景（用户自己的图片 / 视频）
+    //
+    // 渲染端读不到任意磁盘路径，所以走宿主的选文件通道：
+    //   folium.ui.pickFile({ accept: 'image' | 'video', persist: true })
+    // 返回一个 folia-mod://_files/<token>/<name> 的会话 URL（支持 Range，
+    // <video> 能拖能循环），并给出可跨重启恢复的 grantId。
+    // 这里只存 grantId + 文件名 + 类型，每次挂载时用 restoreFile 换回新 URL；
+    // 文件被移动或删除时 restore 返回 null，条目自动剪掉。
+    // -----------------------------------------------------------------------
+
+    const CUSTOM_KEY = 'custom';
+    const CUSTOM_LIMIT = 32;   // 与宿主的 grant 上限一致，超出会顶掉最旧的
+    // 最近一次场景壁纸加载失败的报告：背景里的错误卡与设置面板共用
+    let lastErrorReport = null;
+
+    const REPO_ISSUES_URL = 'https://github.com/zaixiaxingzhang/folia-wallpaper-engine/issues/new';
+
+    const formatErrorLog = (report) => {
+        if (!report) {
+            return '（没有错误记录）';
+        }
+        const lines = [
+            '壁纸引擎背景 · 场景壁纸加载失败',
+            `时间: ${report.at}`,
+            `壁纸: ${report.title}`,
+            `壁纸 id: ${report.id}`,
+            `Folia: ${report.folia}`,
+            `Folium: ${report.folium}`,
+            `WebGL: ${report.webgl}`,
+            `平台: ${report.ua}`,
+            `相关设置: ${report.settings}`,
+            '',
+            '--- 阶段结果 ---',
+            ...(report.attempts?.length > 0 ? report.attempts : ['（没有记录）']),
+            '',
+            '--- 各阶段诊断 ---',
+            ...(report.diag.length > 0
+                ? report.diag.map((entry) => `[${entry.at}] ${entry.stage} (${entry.level}) ${entry.message}`)
+                : ['（没有捕获到具体错误）']),
+        ];
+        return lines.join('\n');
+    };
+
+    const downloadErrorLog = (report) => {
+        try {
+            const text = formatErrorLog(report);
+            const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `壁纸引擎-错误日志-${Date.now()}.txt`;
+            document.body?.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
+            return true;
+        } catch (error) {
+            console.warn('[壁纸引擎] 导出日志失败', error);
+            return false;
+        }
+    };
+
+    const openIssuePage = (report) => {
+        const title = `[Bug] 场景壁纸加载失败：${report?.title ?? '(未知壁纸)'}`;
+        const body = [
+            '### 现象',
+            '场景壁纸在 Folia 里加载失败（实时渲染、合成静态图、单张原画都失败）。',
+            '',
+            '### 环境',
+            `- Folia: ${report?.folia ?? '?'}`,
+            `- Folium: ${report?.folium ?? '?'}`,
+            `- WebGL: ${report?.webgl ?? '?'}`,
+            '',
+            '### 壁纸',
+            `${report?.title ?? '?'}（id: \`${report?.id ?? '?'}\`）`,
+            '',
+            '### 诊断',
+            '```',
+            ...(report?.diag?.length ? report.diag.slice(-20).map((entry) => `${entry.stage}: ${entry.message}`) : ['（无）']),
+            '```',
+            '',
+            '> 完整日志由模组里的「导出错误日志」生成，请把文件拖进来。',
+        ].join('\n');
+        const url = `${REPO_ISSUES_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+        // 交给系统浏览器：window.open 会在 Folia 内开标签页，没有浏览器登录态
+        try {
+            const pending = folium.rpc?.call?.('openExternal', { url });
+            if (pending && typeof pending.then === 'function') {
+                pending.then((result) => {
+                    if (result && result.ok === false) {
+                        console.warn('[壁纸引擎] 系统浏览器打开失败', result.error);
+                    }
+                }).catch((error) => console.warn('[壁纸引擎] 系统浏览器打开失败', error));
+                return true;
+            }
+        } catch (error) {
+            console.warn('[壁纸引擎] 系统浏览器打开失败', error);
+        }
+        return false;
+    };
+
+    let customCache = null;    // [{ grantId, name, kind, url }]
+    let customPromise = null;
+
+    const isCustomEntry = (value) => (
+        value
+        && typeof value === 'object'
+        && typeof value.grantId === 'string'
+        && (value.kind === 'image' || value.kind === 'video')
+    );
+
+    const readCustomEntries = async () => {
+        try {
+            const value = await folium.storage.get(CUSTOM_KEY);
+            return Array.isArray(value) ? value.filter(isCustomEntry) : [];
+        } catch {
+            return [];
+        }
+    };
+
+    const writeCustomEntries = async (entries) => {
+        const trimmed = entries.slice(-CUSTOM_LIMIT);
+        try {
+            await folium.storage.set(CUSTOM_KEY, trimmed);
+        } catch (error) {
+            console.warn('[壁纸引擎] 保存自定义背景失败', error);
+        }
+        customCache = null;
+        notify();
+        return trimmed;
+    };
+
+    /*
+     * 把存下来的 grantId 换成这次运行的 URL。恢复失败的（文件没了 / 授权被清）
+     * 会从记录里剔掉，并在返回值里标记 removed，面板据此提示一次。
+     */
+    const resolveCustom = async (force) => {
+        if (!force && customCache) {
+            return customCache;
+        }
+        if (!force && customPromise) {
+            return customPromise;
+        }
+        customPromise = (async () => {
+            const entries = await readCustomEntries();
+            const resolved = [];
+            const missing = [];
+            for (const entry of entries) {
+                let handle = null;
+                try {
+                    handle = await folium.ui.restoreFile(entry.grantId);
+                } catch {
+                    handle = null;
+                }
+                if (handle && handle.url) {
+                    resolved.push({ ...entry, url: handle.url, name: handle.name || entry.name });
+                } else {
+                    missing.push(entry);
+                }
+            }
+            if (missing.length > 0) {
+                await writeCustomEntries(entries.filter((entry) => !missing.includes(entry)));
+            }
+            customCache = resolved;
+            return resolved;
+        })().finally(() => {
+            customPromise = null;
+        });
+        return customPromise;
+    };
+
+    const VIDEO_EXT = /\.(mp4|m4v|webm|mov|mkv|avi|wmv|flv|ts|m2ts|3gp|ogv)$/i;
+    const IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|svg|ico|apng|tiff?)$/i;
+
+    /*
+     * 「其他格式」走的是不过滤的文件对话框（accept: 'any'），所以类型得自己按扩展名判断。
+     * 判不出来的直接拒绝——存进列表也只会得到一块黑。
+     */
+    const classifyFile = (name) => (VIDEO_EXT.test(name) ? 'video' : IMAGE_EXT.test(name) ? 'image' : null);
+
+    const addCustomFile = async (kind) => {
+        const handle = await folium.ui.pickFile({ accept: kind, persist: true });
+        if (!handle || !handle.url || !handle.grantId) {
+            return null;
+        }
+        const resolvedKind = kind === 'any' ? classifyFile(handle.name ?? '') : kind;
+        if (!resolvedKind) {
+            try {
+                await folium.ui.releaseFile(handle.grantId);
+            } catch {
+                /* 授权已经不在，忽略 */
+            }
+            throw new Error(`认不出这个文件类型：${handle.name ?? ''}`);
+        }
+        const entries = await readCustomEntries();
+        await writeCustomEntries([...entries, { grantId: handle.grantId, name: handle.name, kind: resolvedKind }]);
+        return { ...handle, kind: resolvedKind };
+    };
+
+    const removeCustomFile = async (grantId) => {
+        const entries = await readCustomEntries();
+        await writeCustomEntries(entries.filter((entry) => entry.grantId !== grantId));
+        try {
+            await folium.ui.releaseFile(grantId);
+        } catch {
+            /* 授权已经不在，忽略 */
+        }
+    };
+
     const readState = async () => {
         try {
             const value = await folium.storage.get('selection');
@@ -114,6 +337,15 @@ export default function activate(folium) {
     };
 
     const SETTINGS = [
+        {
+            key: 'library', type: 'select', defaultValue: 'we',
+            label: t('取图来源', 'Source'),
+            description: t('「壁纸引擎库」用 Wallpaper Engine 的壁纸；「我的文件」用你自己添加的图片或视频', '“Wallpaper Engine” uses your Wallpaper Engine library; “My files” uses images or videos you added yourself'),
+            options: [
+                { value: 'we', label: t('壁纸引擎库', 'Wallpaper Engine') },
+                { value: 'custom', label: t('我的图片与视频', 'My own files') },
+            ],
+        },
         {
             key: 'mode', type: 'select', defaultValue: 'random',
             label: t('壁纸来源', 'Wallpaper source'),
@@ -145,17 +377,6 @@ export default function activate(folium) {
             description: t('只从视频与网页壁纸里抽。场景壁纸（scene.pkg）第三方无法渲染，只能放预览图', 'Draw only from video and web wallpapers. Scene wallpapers (scene.pkg) cannot be rendered by third parties and fall back to their preview image'),
         },
         {
-            key: 'sceneSource', type: 'select', defaultValue: 'live',
-            label: t('场景壁纸还原方式', 'Scene wallpaper rendering'),
-            description: t('「实时渲染」用内置的 WebWallGL 引擎真正跑场景（着色器、粒子、视差都在，与 Wallpaper Engine 里一致）；其余三档是静态兜底：合成各层原图 / 只取背景层 / 官方动画预览', '“Live” runs the scene through the bundled WebWallGL engine — shaders, particles and parallax included. The other three are still fallbacks: composited layers, single layer, official preview'),
-            options: [
-                { value: 'live', label: t('实时渲染（推荐）', 'Live render') },
-                { value: 'composite', label: t('合成静态图', 'Composited still') },
-                { value: 'art', label: t('单张原画', 'Single layer') },
-                { value: 'preview', label: t('动画预览', 'Animated preview') },
-            ],
-        },
-        {
             key: 'sceneFps', type: 'number', defaultValue: 30, min: 15, max: 60, step: 5,
             label: t('场景帧率', 'Scene frame rate'),
             description: t('实时渲染场景的帧率上限；调低可省电、省 GPU', 'Frame-rate cap for live scenes; lower it to save power'),
@@ -176,9 +397,9 @@ export default function activate(folium) {
             ],
         },
         {
-            key: 'motion', type: 'boolean', defaultValue: true,
-            label: t('缓慢推拉', 'Slow pan'),
-            description: t('静态壁纸加一点缓慢缩放，避免画面死板', 'A slow zoom on still wallpapers so the frame does not feel dead'),
+            key: 'motionAmount', type: 'number', defaultValue: 30, min: 0, max: 100, step: 1,
+            label: t('跟随鼓点推拉', 'Beat zoom'),
+            description: t('0 关闭；往右拉是幅度更大的推拉。判定方式与自带「隐现」背景一致：全频段加权后看帧间上升量，起得快、落得慢', '0 turns it off; drag right for a bigger push. Detection matches the built-in “latent” background: weighted bands, frame-to-frame rise, fast attack and slow release'),
         },
         {
             key: 'blur', type: 'number', defaultValue: 0, min: 0, max: 40, step: 1,
@@ -362,6 +583,21 @@ export default function activate(folium) {
         }
     };
 
+    /*
+     * 自定义文件走同一套选法：指定 / 伪随机 / 跟随桌面（后者没有桌面可跟，
+     * 退回伪随机，面板里会写明）。自定义条目本来就少，抽中率是均匀的。
+     */
+    const chooseCustom = (entries, settings, context, selection) => {
+        if (!Array.isArray(entries) || entries.length === 0) {
+            return null;
+        }
+        if (settings.mode === 'fixed') {
+            return entries.find((entry) => entry.grantId === selection.customId) ?? entries[0];
+        }
+        const index = fnv1a(`${settings.seed}|${shuffleKey(settings, context)}`) % entries.length;
+        return entries[index];
+    };
+
     const chooseWallpaper = (library, settings, context, selection) => {
         if (!library || !Array.isArray(library.items) || library.items.length === 0) {
             return null;
@@ -427,7 +663,7 @@ export default function activate(folium) {
         const style = document.createElement('style');
         style.textContent = `
             .wp-eng-root { position: absolute; inset: 0; overflow: hidden; contain: strict; background: #06070a; }
-            .wp-eng-media { position: absolute; inset: 0; transform-origin: 50% 50%; will-change: transform, filter; }
+            .wp-eng-media { position: absolute; inset: 0; transform-origin: 50% 50%; will-change: transform; }
             .wp-eng-media > video, .wp-eng-media > img, .wp-eng-media > canvas { width: 100%; height: 100%; display: block; object-fit: cover; border: 0; }
             .wp-eng-media > iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity 700ms ease; }
             .wp-eng-media > iframe.wp-eng-ready { opacity: 1; }
@@ -440,8 +676,41 @@ export default function activate(folium) {
                 opacity: 0; transition: opacity 500ms ease;
             }
             .wp-eng-info.wp-eng-visible { opacity: 1; }
-            @keyframes wp-eng-pan-a { from { transform: scale(1.02) translate3d(0, 0, 0); } to { transform: scale(1.12) translate3d(-1.5%, -1.2%, 0); } }
-            @keyframes wp-eng-pan-b { from { transform: scale(1.12) translate3d(1.4%, 1%, 0); } to { transform: scale(1.02) translate3d(0, 0, 0); } }
+            .wp-eng-error { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 6; }
+            .wp-eng-error-card {
+                max-width: min(560px, 90%); border-radius: 16px; padding: 18px 20px;
+                background: rgba(12, 13, 18, 0.9); border: 1px solid rgba(255, 255, 255, 0.14);
+                color: #f2f3f5; font: 400 12px/1.7 "Microsoft YaHei UI", system-ui, sans-serif;
+                box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55); pointer-events: auto;
+                backdrop-filter: blur(12px);
+            }
+            .wp-eng-error-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+            .wp-eng-error-sub { color: rgba(255, 255, 255, 0.62); margin-bottom: 12px; word-break: break-all; }
+            .wp-eng-error-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+            .wp-eng-error-actions button {
+                cursor: pointer; border-radius: 8px; padding: 6px 12px; font-size: 11.5px;
+                border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.1); color: #fff;
+            }
+            .wp-eng-error-actions button:hover { background: rgba(255, 255, 255, 0.2); }
+            .wp-eng-error-status { margin-top: 10px; color: rgba(255, 255, 255, 0.55); min-height: 16px; }
+            .wp-eng-toast {
+                position: absolute; top: 14px; left: 50%; transform: translate(-50%, -8px);
+                display: flex; align-items: center; gap: 10px; max-width: min(720px, 92%);
+                padding: 9px 12px; border-radius: 12px; z-index: 7; pointer-events: auto;
+                background: rgba(14, 15, 20, 0.92); border: 1px solid rgba(255, 255, 255, 0.16);
+                color: #f2f3f5; font: 400 12px/1.5 "Microsoft YaHei UI", system-ui, sans-serif;
+                box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5); backdrop-filter: blur(10px);
+                opacity: 0; transition: opacity 220ms ease, transform 220ms ease;
+            }
+            .wp-eng-toast.wp-eng-in { opacity: 1; transform: translate(-50%, 0); }
+            .wp-eng-toast-text { flex: 1; min-width: 0; }
+            .wp-eng-toast-sub { color: rgba(255, 255, 255, 0.6); font-size: 11px; }
+            .wp-eng-toast button {
+                flex: none; cursor: pointer; border-radius: 8px; padding: 5px 11px; font-size: 11.5px;
+                border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(255, 255, 255, 0.14); color: #fff;
+            }
+            .wp-eng-toast button:hover { background: rgba(255, 255, 255, 0.24); }
+            .wp-eng-toast button.wp-eng-ghost { background: transparent; border-color: rgba(255, 255, 255, 0.16); color: rgba(255, 255, 255, 0.7); }
         `;
 
         const root = document.createElement('div');
@@ -461,8 +730,11 @@ export default function activate(folium) {
 
         let media = null;          // video | img | iframe | canvas | live host
         let currentKey = null;
-        let panVariant = 0;
         let liveInstance = null;   // WebWallGL 实例（场景实时渲染时才有）
+        let customMedia = false;   // 当前媒体来自 folia-mod://（画布不可采样）
+        let sceneErrorCard = null; // 场景三层都失败时的错误卡
+        let sceneToast = null;     // 实时渲染失败、但兜底成功时的顶部提示
+        let sceneToastTimer = 0;
         let stopLive = null;   // 实时场景的停止函数列表
         let cleanupMedia = null;
         let disposed = false;
@@ -519,11 +791,11 @@ export default function activate(folium) {
                 return;
             }
             if (media.tagName === 'IMG' && media.complete && media.naturalWidth > 0) {
-                paintReadability(sampleBandLuminance(media));
+                paintReadability(sampleBandLuminance(media) ?? (customMedia ? 0.34 : null));
                 return;
             }
             if (media.tagName === 'CANVAS') {
-                paintReadability(sampleBandLuminance(media));
+                paintReadability(sampleBandLuminance(media) ?? (customMedia ? 0.34 : null));
                 return;
             }
             if (media.tagName === 'VIDEO' && media.readyState >= 2 && media.videoWidth > 0) {
@@ -531,13 +803,139 @@ export default function activate(folium) {
             }
         };
 
+        /*
+         * 鼓点推拉。
+         *
+         * 判定方式照搬 Folia 自带的「隐现（latent）」背景（playerOverlayLayout 里的
+         * enhancedBeatResponse 分支），它比单纯盯低频稳得多：
+         *   1. 全频段加权后开 0.55 次方（压缩动态，小音量也有反应）：
+         *      (bass*.22 + lowMid*.18 + mid*.22 + vocal*.28 + treble*.1) ** 0.55
+         *   2. 鼓点 = 本帧电平相对上一帧的「上升量 × 7」，每帧衰减 0.84
+         *   3. 合成 = 电平*0.42 + 鼓点*0.85
+         *   4. 输出做非对称平滑：上升 0.42、回落 0.14（起得快、落得慢，不像之前那样发颤）
+         * 滑块 0..100 线性映射到最大 8% 的额外缩放；0 关闭。
+         */
+        const MOTION_MAX = 0.05;   // 滑块 100% 时的最大额外缩放
+
+        let motionRaf = 0;
+        let motionBeat = 0;
+        let motionPrevLevel = 0;
+        let motionOutput = 0;
+        let motionLastFrame = 0;
+        let motionWritten = -1;
+
+        const unit = (value) => {
+            const number = Number(value);
+            return Number.isFinite(number) ? Math.min(1, Math.max(0, number)) : 0;
+        };
+
+        // 把「60fps 下每帧的系数」换算成按经过时间生效，掉帧时行为不变
+        const easeAlpha = (perFrame, dt) => 1 - Math.pow(1 - perFrame, Math.min(0.1, dt) * 60);
+
+        const motionStrength = () => Math.min(1, Math.max(0, Number(context.getSettings().motionAmount) / 100));
+
+        const baseScale = () => (Number(context.getSettings().blur) > 0 ? 1.06 : 1);
+
+        // 图片、视频、网页、实时场景都能被外层缩放带动
+        const motionAllowed = () => {
+            if (disposed || !media || context.staticMode) {
+                return false;
+            }
+            return motionStrength() > 0;
+        };
+
+        const writeScale = (scale) => {
+            if (Math.abs(scale - motionWritten) < 0.0002) {
+                return;
+            }
+            motionWritten = scale;
+            mediaWrap.style.transform = `scale(${scale.toFixed(4)})`;
+        };
+
+        const stopMotion = () => {
+            if (motionRaf) {
+                if (typeof cancelAnimationFrame === 'function') {
+                    cancelAnimationFrame(motionRaf);
+                }
+                motionRaf = 0;
+            }
+            motionBeat = 0;
+            motionPrevLevel = 0;
+            motionOutput = 0;
+            motionLastFrame = 0;
+            motionWritten = -1;
+        };
+
+        const tickMotion = (now) => {
+            motionRaf = 0;
+            if (!motionAllowed()) {
+                stopMotion();
+                writeScale(baseScale());
+                return;
+            }
+            const first = motionLastFrame === 0;
+            const dt = first ? 0.016 : Math.min(0.05, (now - motionLastFrame) / 1000);
+            motionLastFrame = now;
+            const paused = context.isPaused();
+
+            let bands = null;
+            if (!paused) {
+                try {
+                    bands = typeof context.audio?.getBands === 'function' ? context.audio.getBands() : null;
+                } catch {
+                    bands = null;
+                }
+            }
+            if (!bands) {
+                bands = { bass: 0, lowMid: 0, mid: 0, vocal: 0, treble: 0 };
+            }
+            const combined = unit(bands.bass) * 0.22
+                + unit(bands.lowMid) * 0.18
+                + unit(bands.mid) * 0.22
+                + unit(bands.vocal) * 0.28
+                + unit(bands.treble) * 0.1;
+            // 低电平当成静音：0.08 以下不放大，避免底噪让画面一直鼓着
+            const level = combined <= 0.08 ? 0 : Math.pow((combined - 0.08) / 0.92, 0.55);
+
+            if (first) {
+                motionPrevLevel = level;
+            }
+            const rise = Math.max(0, (level - motionPrevLevel) * 7);
+            motionPrevLevel = level;
+            motionBeat = Math.max(motionBeat * Math.pow(0.84, dt * 60), Math.min(1, rise));
+
+            const drive = Math.min(1, level * 0.42 + motionBeat * 0.85);
+            motionOutput += (drive - motionOutput) * easeAlpha(drive > motionOutput ? 0.42 : 0.14, dt);
+            if (motionOutput < 0.0015) {
+                motionOutput = 0;
+            }
+
+            writeScale(baseScale() * (1 + motionOutput * MOTION_MAX * motionStrength()));
+            motionRaf = requestAnimationFrame(tickMotion);
+        };
+
+        const startMotion = () => {
+            if (typeof requestAnimationFrame !== 'function') {
+                writeScale(baseScale());
+                return;
+            }
+            if (!motionAllowed()) {
+                stopMotion();
+                writeScale(baseScale());
+                return;
+            }
+            if (!motionRaf) {
+                motionLastFrame = 0;
+                motionRaf = requestAnimationFrame(tickMotion);
+            }
+        };
+
         const applyFilters = () => {
             const settings = context.getSettings();
             const blur = Math.max(0, Number(settings.blur) || 0);
             const saturation = Math.max(0, Number(settings.saturation) || 0);
-            const scale = blur > 0 ? 1.06 : 1;
+            // 模糊会吃掉边缘，稍微放大一点盖住；推拉幅度由鼓点循环接管
             mediaWrap.style.filter = `blur(${blur}px) saturate(${saturation})`;
-            mediaWrap.style.transform = `scale(${scale})`;
 
             dim.style.opacity = String(Math.max(0, Math.min(1, Number(settings.dim) || 0)));
             const vignetteStrength = Math.max(0, Math.min(1, Number(settings.vignette) || 0));
@@ -560,14 +958,8 @@ export default function activate(folium) {
                 media.style.objectFit = fit;
             }
 
-            // 实时场景有自己的相机与视差，别再叠 Ken Burns（会打架）
-            if (media && media.tagName !== 'IFRAME' && !liveInstance) {
-                mediaWrap.style.animation = settings.motion
-                    ? `${panVariant % 2 === 0 ? 'wp-eng-pan-a' : 'wp-eng-pan-b'} 34s ease-in-out infinite alternate`
-                    : 'none';
-            } else {
-                mediaWrap.style.animation = 'none';
-            }
+            // 实时场景有自己的相机，静态图才需要跟随鼓点
+            startMotion();
 
             info.classList.toggle('wp-eng-visible', settings.showInfo !== false);
 
@@ -598,6 +990,7 @@ export default function activate(folium) {
         };
 
         const teardownMedia = () => {
+            stopMotion();
             if (cleanupMedia) {
                 try {
                     cleanupMedia();
@@ -619,6 +1012,7 @@ export default function activate(folium) {
                 media.remove();
                 media = null;
             }
+            customMedia = false;
             mediaWrap.replaceChildren();
         };
 
@@ -667,6 +1061,44 @@ export default function activate(folium) {
         };
 
         /*
+         * 场景加载的诊断记录。场景壁纸可能在三层里都失败，原因各不相同，
+         * 用户要报 bug 时手里得有一份能看的东西，所以每一层都把原因记下来。
+         */
+        const attempts = [];
+        const noteAttempt = (stage, ok, detail) => {
+            attempts.push(`${ok ? 'OK' : 'FAIL'} ${stage}${detail ? ` — ${String(detail).slice(0, 200)}` : ''}`);
+            if (attempts.length > 12) {
+                attempts.shift();
+            }
+        };
+
+        const diag = [];
+        const pushDiag = (stage, message, level = 'error') => {
+            const text = typeof message === 'string' ? message : String(message?.message ?? message);
+            diag.push({ at: new Date().toISOString(), stage, level, message: text.slice(0, 400) });
+            if (diag.length > 120) {
+                diag.splice(0, diag.length - 120);
+            }
+            if (level === 'error') {
+                console.warn(`[壁纸引擎] ${stage}: ${text}`);
+            }
+        };
+
+        const webglInfo = () => {
+            try {
+                const probe = document.createElement('canvas');
+                const gl2 = probe.getContext('webgl2');
+                if (gl2) {
+                    return 'WebGL2';
+                }
+                const gl1 = probe.getContext('webgl');
+                return gl1 ? 'WebGL1' : '不可用';
+            } catch {
+                return '检测失败';
+            }
+        };
+
+        /*
          * 场景壁纸不是静态图：它是多层 2.5D 场景，每层一张带透明通道的贴图。
          * 主进程把「画幅 + 每层的场景矩形 + 贴图字节区间」整理好，这里按顺序
          * 叠到一张 canvas 上，得到一张分辨率远超官方预览图的完整画面。
@@ -674,19 +1106,24 @@ export default function activate(folium) {
          */
         const compositeScene = async (item, isCancelled) => {
             if (!library?.base) {
+                pushDiag('合成静态图', '本地服务没有就绪（library.base 为空）');
                 return false;
             }
             let manifest;
             try {
                 const res = await fetch(`${library.base}/i/${encodeURIComponent(item.id)}/scene`, { cache: 'no-store' });
                 if (!res.ok) {
+                    pushDiag('合成静态图', `图层清单返回 HTTP ${res.status}`);
                     return false;
                 }
                 manifest = await res.json();
-            } catch {
+            } catch (error) {
+                pushDiag('合成静态图', `读取图层清单失败：${error?.message ?? error}`);
                 return false;
             }
             if (!manifest?.ok || !Array.isArray(manifest.layers) || manifest.layers.length === 0 || !manifest.frame) {
+                pushDiag('合成静态图', 'scene.pkg 里没有可用的纯贴图层（可能全部是着色器或 DXT 贴图）');
+                noteAttempt('合成静态图', false, '没有可合成的贴图层');
                 return false;
             }
             if (isCancelled()) {
@@ -707,6 +1144,7 @@ export default function activate(folium) {
             painter.fillRect(0, 0, width, height);
             media = canvas;
             mediaWrap.append(canvas);
+            startMotion();
 
             const scale = Math.max(width / frame.w, height / frame.h);
             for (const layer of manifest.layers) {
@@ -742,6 +1180,7 @@ export default function activate(folium) {
                 }
             }
             painter.globalAlpha = 1;
+            noteAttempt('合成静态图', true, `${manifest.layers.length} 层`);
             refreshReadability();
             return true;
         };
@@ -753,12 +1192,15 @@ export default function activate(folium) {
          */
         const liveScene = async (item, settings, isCancelled, registerStop) => {
             if (!library?.base) {
+                pushDiag('实时渲染', '本地服务没有就绪（library.base 为空）');
                 return false;
             }
             let engine;
             try {
                 engine = await loadEngine();
-            } catch {
+            } catch (error) {
+                pushDiag('实时渲染', `引擎脚本加载失败：${error?.message ?? error}`);
+                noteAttempt('实时渲染', false, `引擎脚本加载失败：${error?.message ?? error}`);
                 return false;
             }
             if (isCancelled()) {
@@ -766,21 +1208,13 @@ export default function activate(folium) {
             }
 
             let poster = null;
-            if (item.preview) {
-                poster = document.createElement('img');
-                poster.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:brightness(0.72)';
-                const posterUrl = httpUrl(library, item, item.preview);
-                if (posterUrl) {
-                    poster.src = posterUrl;
-                }
-                poster.addEventListener('error', () => poster?.remove(), { once: true });
-                mediaWrap.append(poster);
-            }
 
             const host = document.createElement('div');
             host.style.cssText = 'position:absolute;inset:0;';
             mediaWrap.append(host);
 
+            // 引擎是否已经产出过装配/首帧诊断
+            let engineAlive = false;
             let instance;
             try {
                 instance = engine.createScene(host, {
@@ -790,13 +1224,25 @@ export default function activate(folium) {
                     autoplay: true,
                     // 部分壁纸靠 SceneScript 驱动时钟/文字/属性联动；关掉更安全但会僵住
                     scripts: settings.sceneScripts !== false,
+                    onError: (error) => {
+                        // 引擎自己报的致命错误，原样记进日志（下次导出就能看到真正原因）
+                        pushDiag('实时渲染', `引擎错误：${error?.message ?? error}`, 'error');
+                        noteAttempt('实时渲染', false, `引擎错误：${error?.message ?? error}`);
+                    },
                     onDiagnostic: (message, level) => {
-                        if (level === 'error') {
-                            console.warn(`[壁纸引擎] ${message}`);
+                        // 引擎吐过装配/首帧的 info，就说明它确实跑起来了。
+                        // 后面 load() 的 promise 即使被拒，也不该把已经渲染的画面扔掉。
+                        // 只有「渲染器真的起来了」才算活着。仅凭「包已收到」会让
+                        // 卡在装配阶段的场景一直留一块黑屏，不如老实降级。
+                        if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
+                            engineAlive = true;
                         }
+                        pushDiag('实时渲染', message, level === 'error' ? 'error' : 'info');
                     },
                 });
             } catch (error) {
+                pushDiag('实时渲染', `createScene 失败：${error?.message ?? error}`);
+                noteAttempt('实时渲染', false, `createScene 失败：${error?.message ?? error}`);
                 host.remove();
                 poster?.remove();
                 return false;
@@ -805,6 +1251,7 @@ export default function activate(folium) {
             let destroyed = false;
             liveInstance = instance;
             media = host;
+            startMotion();
             const stop = () => {
                 if (destroyed) {
                     return;
@@ -825,18 +1272,37 @@ export default function activate(folium) {
             attachMedia(instance, engine, registerStop);
 
             const source = engine.httpSource(`${library.base}/i/${encodeURIComponent(item.id)}/r`);
-            // 首帧可能很久（大包解析）；最多等 25 秒，之后让它在后台继续装配
-            const timeout = new Promise((resolve) => setTimeout(resolve, 25000));
-            try {
-                await Promise.race([instance.load(source), timeout]);
-            } catch (error) {
-                stop();
-                host.remove();
-                poster?.remove();
-                return false;
+            // 首帧可能很久（大包解析）。等 20 秒：超时但引擎已经在装配，就让它继续跑；
+            // 只有从头到尾没有任何装配迹象，才算失败。
+            const firstFrame = instance.load(source)
+                .then(() => 'ready', (error) => ({ reason: error?.message ?? String(error) }))
+                .catch(() => ({ reason: 'load-failed' }));
+            const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000));
+            const outcome = await Promise.race([firstFrame, timeout]);
+            if (outcome !== 'ready' && !destroyed && !isCancelled()) {
+                if (engineAlive) {
+                    // 引擎已经在渲染（装配日志、首帧都可能晚于 load 的 promise）
+                    pushDiag('实时渲染', `load 未在预期时间内完成（${typeof outcome === 'string' ? outcome : outcome.reason}），但引擎已在渲染，继续使用`, 'info');
+                } else {
+                    const reason = typeof outcome === 'string' ? outcome : outcome.reason;
+                    pushDiag('实时渲染', `scene.pkg 解析失败：${reason}`);
+                    noteAttempt('实时渲染', false, reason);
+                    stop();
+                    host.remove();
+                    poster?.remove();
+                    return false;
+                }
             }
             if (destroyed) {
+                noteAttempt('实时渲染', true, '已被取消但引擎曾启动');
                 return true;
+            }
+            noteAttempt('实时渲染', true, engineAlive ? '引擎已渲染' : `load=${typeof outcome === 'string' ? outcome : 'ok'}`);
+            // 壁纸自带的 BGM 一律不播
+            try {
+                instance.setVolume?.(0);
+            } catch {
+                /* 老版本引擎没有 setVolume */
             }
             poster?.remove();
             info.textContent = formatCaption(item, 'live');
@@ -857,70 +1323,111 @@ export default function activate(folium) {
          * 之前跟音乐毫无关系。ctx.audio 给的是 64 段 Uint8Array（0..255），
          * 引擎要的是左右声道各 64 段、0..1 的浮点。
          */
-        const attachAudio = (instance) => {
+        /*
+         * 把 Folia 的实时频谱读成 WE 的 128 段格式（左 64 + 右 64，0..1）。
+         * scene 走引擎的 setAudio，网页壁纸走 postMessage 推给注入的垫片。
+         */
+        // 上一帧的输出，用于暂停时平滑衰减（直接清零会「啪」一下，保留残留又会抽搐）
+        const lastLeft = new Float32Array(64);
+        const lastRight = new Float32Array(64);
+
+        // 噪声门限：极小的值直接归零，避免静音段细碎抖动；同时记下本帧供暂停时衰减
+        const gateAndRemember = (left, right) => {
+            for (let index = 0; index < 64; index += 1) {
+                if (left[index] < 0.015) {
+                    left[index] = 0;
+                }
+                if (right[index] < 0.015) {
+                    right[index] = 0;
+                }
+                lastLeft[index] = left[index];
+                lastRight[index] = right[index];
+            }
+        };
+
+        const fillAudioFrames = (left, right) => {
+            /*
+             * 暂停时 Folia 的频谱仍会抖动（分析器没数据时也吐噪声），
+             * 壁纸的频谱条就会一直抽。这里直接不读，改为把上一帧按 0.82 逐帧衰减到 0。
+             */
+            if (context.isPaused()) {
+                for (let index = 0; index < 64; index += 1) {
+                    const l = lastLeft[index] * 0.82;
+                    const r = lastRight[index] * 0.82;
+                    lastLeft[index] = l < 0.002 ? 0 : l;
+                    lastRight[index] = r < 0.002 ? 0 : r;
+                    left[index] = lastLeft[index];
+                    right[index] = lastRight[index];
+                }
+                return;
+            }
             const audio = context.audio;
-            if (!audio || typeof instance.setAudio !== 'function') {
+            let spectrum = null;
+            try {
+                spectrum = audio && typeof audio.getSpectrum === 'function' ? audio.getSpectrum() : null;
+            } catch {
+                spectrum = null;
+            }
+            // 频谱数组存在但整排是 0（未开始分析 / 静音段）时退到分频能量，
+            // 否则壁纸会一直「没反应」
+            let spectrumPeak = 0;
+            if (spectrum) {
+                for (let index = 0; index < spectrum.length; index += 1) {
+                    const raw = Number(spectrum[index]) || 0;
+                    const value = raw > 1 ? raw / 255 : raw;
+                    if (value > spectrumPeak) {
+                        spectrumPeak = value;
+                    }
+                }
+            }
+            if (spectrum && spectrum.length > 0 && spectrumPeak > 0.01) {
+                const count = Math.min(64, spectrum.length);
+                for (let index = 0; index < count; index += 1) {
+                    const raw = spectrum[index];
+                    const value = raw > 1 ? Math.min(1, raw / 255) : Math.max(0, raw);
+                    left[index] = value;
+                    right[index] = value;
+                }
+                for (let index = count; index < 64; index += 1) {
+                    left[index] = 0;
+                    right[index] = 0;
+                }
+                return;
+            }
+            let bands = null;
+            let power = 0;
+            try {
+                bands = audio && typeof audio.getBands === 'function' ? audio.getBands() : null;
+                power = audio && typeof audio.getPower === 'function' ? Number(audio.getPower()) || 0 : 0;
+            } catch {
+                bands = null;
+                power = 0;
+            }
+            const shape = bands
+                ? [bands.bass, bands.lowMid, bands.mid, bands.vocal, bands.treble]
+                : [power, power, power, power, power];
+            for (let index = 0; index < 64; index += 1) {
+                const band = shape[Math.min(shape.length - 1, Math.floor((index / 64) * shape.length))] ?? 0;
+                const value = Math.max(0, Math.min(1, Number(band) || 0));
+                left[index] = value;
+                right[index] = value;
+            }
+            gateAndRemember(left, right);
+        };
+
+        const attachAudio = (instance) => {
+            if (!context.audio || typeof instance.setAudio !== 'function') {
                 return;
             }
             const left = new Float32Array(64);
             const right = new Float32Array(64);
-            const source = {
-                snapshot() {
-                    let spectrum = null;
-                    try {
-                        spectrum = typeof audio.getSpectrum === 'function' ? audio.getSpectrum() : null;
-                    } catch {
-                        spectrum = null;
-                    }
-                    if (spectrum && spectrum.length > 0) {
-                        const count = Math.min(64, spectrum.length);
-                        for (let index = 0; index < count; index += 1) {
-                            const raw = spectrum[index];
-                            const value = raw > 1 ? Math.min(1, raw / 255) : Math.max(0, raw);
-                            left[index] = value;
-                            right[index] = value;
-                        }
-                        for (let index = count; index < 64; index += 1) {
-                            left[index] = 0;
-                            right[index] = 0;
-                        }
-                        return { left, right };
-                    }
-                    // 没频谱时按分频能量铺一条曲线，总比全零好看，也比假跳动诚实
-                    let bands = null;
-                    let power = 0;
-                    try {
-                        bands = typeof audio.getBands === 'function' ? audio.getBands() : null;
-                        power = typeof audio.getPower === 'function' ? Number(audio.getPower()) || 0 : 0;
-                    } catch {
-                        bands = null;
-                        power = 0;
-                    }
-                    const shape = bands
-                        ? [bands.bass, bands.lowMid, bands.mid, bands.vocal, bands.treble]
-                        : [power, power, power, power, power];
-                    for (let index = 0; index < 64; index += 1) {
-                        const band = shape[Math.min(shape.length - 1, Math.floor((index / 64) * shape.length))] ?? 0;
-                        const value = Math.max(0, Math.min(1, Number(band) || 0));
-                        left[index] = value;
-                        right[index] = value;
-                    }
-                    return { left, right };
-                },
-            };
             try {
-                instance.setAudio(source);
+                instance.setAudio({ snapshot: () => { fillAudioFrames(left, right); return { left, right }; } });
             } catch {
                 /* 老版本引擎没有 setAudio */
             }
         };
 
-        /*
-         * 音频识别 / 正在播放：把 Folia 的当前歌曲喂给引擎。
-         * 引擎默认是内置模拟曲目，所以「媒体播放器」类壁纸之前显示的是假歌名、
-         * 假进度。folium.playback.getState() 给的是 { song, state, position, duration }。
-         * 切歌、播放/暂停、进度漂移过大时重建一次媒体源。
-         */
         const attachMedia = (instance, engine, registerStop) => {
             if (typeof engine?.createMediaSource !== 'function' || typeof instance.setMedia !== 'function') {
                 return;
@@ -932,6 +1439,32 @@ export default function activate(folium) {
                     return null;
                 }
             };
+            /*
+             * 换歌判定不能只看 song.id：宿主给的歌曲 DTO 里 id 往往不存在（用的是 ref，
+             * 而且 ref 每次都是新分配的），于是 key 永远不变、一直显示上一首。
+             * 这里把能区分的字段都拼上，任何一项变了就重建媒体源。
+             */
+            const signatureOf = (state) => {
+                const song = state?.song ?? null;
+                if (!song) {
+                    return `none|${state?.state ?? ''}`;
+                }
+                let cover = '';
+                try {
+                    cover = context.getCoverUrl?.() ?? '';
+                } catch {
+                    cover = '';
+                }
+                return [
+                    state?.state ?? '',
+                    song.ref ?? song.id ?? '',
+                    song.title ?? '',
+                    song.artist ?? '',
+                    song.album ?? '',
+                    cover,
+                ].join('|');
+            };
+
             let built = null;
             const build = () => {
                 const state = readPlayback();
@@ -961,7 +1494,7 @@ export default function activate(folium) {
                 } catch {
                     return;
                 }
-                built = { key: `${song?.id ?? ''}|${state?.state ?? ''}`, at: Date.now(), position };
+                built = { key: signatureOf(state), at: Date.now(), position };
                 try {
                     instance.setMedia(source);
                 } catch {
@@ -974,9 +1507,7 @@ export default function activate(folium) {
             }
             const stop = context.every(1000, () => {
                 const state = readPlayback();
-                const song = state?.song ?? null;
-                const key = `${song?.id ?? ''}|${state?.state ?? ''}`;
-                if (!built || key !== built.key) {
+                if (!built || signatureOf(state) !== built.key) {
                     build();
                     return;
                 }
@@ -995,11 +1526,462 @@ export default function activate(folium) {
             });
         };
 
+        /* 最后一层兜底：只取 scene.pkg 里的背景原图；失败就返回 false，交给错误卡 */
+        const paintSceneArt = (item, isCancelled) => {
+            const url = artUrl(library, item);
+            if (!url) {
+                pushDiag('单张原画', '这张壁纸没有可抽取的背景原图');
+                return Promise.resolve(false);
+            }
+            return new Promise((resolve) => {
+                const image = document.createElement('img');
+                image.decoding = 'async';
+                image.crossOrigin = 'anonymous';
+                image.style.objectFit = context.getSettings().fit === 'contain' || context.getSettings().fit === 'fill'
+                    ? context.getSettings().fit
+                    : 'cover';
+                let settled = false;
+                let timer = null;
+                const settle = (ok) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    if (timer) {
+                        clearTimeout(timer);
+                    }
+                    image.removeEventListener('load', onLoad);
+                    image.removeEventListener('error', onError);
+                    resolve(ok);
+                };
+                const onLoad = () => {
+                    if (isCancelled()) {
+                        settle(true);
+                        return;
+                    }
+                    media = image;
+                    mediaWrap.append(image);
+                    info.textContent = formatCaption(item, 'art');
+                    startMotion();
+                    refreshReadability();
+                    settle(true);
+                };
+                const onError = () => {
+                    pushDiag('单张原画', '背景原图加载失败（接口不可用或图片解码失败）');
+                    settle(false);
+                };
+                // 请求卡住（服务不响应）时不能一直等，12 秒后按失败处理
+                timer = setTimeout(() => {
+                    pushDiag('单张原画', '背景原图 12 秒内没有返回');
+                    settle(false);
+                }, 12000);
+                image.addEventListener('load', onLoad);
+                image.addEventListener('error', onError);
+                image.src = url;
+                if (typeof image.complete === 'boolean' && image.complete && image.naturalWidth > 0) {
+                    onLoad();
+                }
+            });
+        };
+
+        /*
+         * 实时渲染失败、但兜底成功了：顶部弹一条提示，5 秒后自动收起。
+         * 点「上报」= 导出日志 + 打开仓库的 issue 页面，然后把提示收掉。
+         */
+        const TOAST_MS = 5000;
+
+        const clearSceneToast = () => {
+            if (sceneToastTimer) {
+                clearTimeout(sceneToastTimer);
+                sceneToastTimer = 0;
+            }
+            if (sceneToast) {
+                sceneToast.remove();
+                sceneToast = null;
+            }
+        };
+
+        const showSceneToast = (item, fallbackName) => {
+            clearSceneToast();
+            const report = buildFailureReport(item);
+
+            const toast = document.createElement('div');
+            toast.className = 'wp-eng-toast';
+
+            const text = document.createElement('div');
+            text.className = 'wp-eng-toast-text';
+            const line = document.createElement('div');
+            line.textContent = '实时渲染失败，已启用兜底服务';
+            const sub = document.createElement('div');
+            sub.className = 'wp-eng-toast-sub';
+            sub.textContent = `当前显示：${fallbackName}。是否上报日志？`;
+            text.append(line, sub);
+
+            const reportBtn = document.createElement('button');
+            reportBtn.type = 'button';
+            reportBtn.textContent = '上报';
+            reportBtn.addEventListener('click', () => {
+                downloadErrorLog(report);
+                openIssuePage(report);
+                sub.textContent = '日志已导出，已打开仓库的 issue 页面';
+                reportBtn.disabled = true;
+                reportBtn.textContent = '已上报';
+                clearTimeout(sceneToastTimer);
+                sceneToastTimer = setTimeout(clearSceneToast, 1500);
+            });
+
+            const closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.className = 'wp-eng-ghost';
+            closeBtn.textContent = '不再提示';
+            closeBtn.addEventListener('click', clearSceneToast);
+
+            toast.append(text, reportBtn, closeBtn);
+            root.append(toast);
+            sceneToast = toast;
+            // 下一帧再加 class，让过渡动画生效
+            if (typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(() => toast.classList.add('wp-eng-in'));
+            } else {
+                toast.classList.add('wp-eng-in');
+            }
+
+            sceneToastTimer = setTimeout(clearSceneToast, TOAST_MS);
+        };
+
+        const clearSceneError = () => {
+            if (sceneErrorCard) {
+                sceneErrorCard.remove();
+                sceneErrorCard = null;
+            }
+        };
+
+        const buildFailureReport = (item) => {
+            const settings = context.getSettings();
+            const host = (() => {
+                try {
+                    return folium.host ?? {};
+                } catch {
+                    return {};
+                }
+            })();
+            return {
+                at: new Date().toISOString(),
+                title: item.title,
+                id: item.id,
+                folia: host.folia ?? '未知',
+                folium: host.folium ? `${host.folium.major}.${host.folium.minor}` : '未知',
+                webgl: webglInfo(),
+                ua: typeof navigator !== 'undefined' ? navigator.userAgent : '未知',
+                settings: `sceneFps=${settings.sceneFps}, sceneScripts=${settings.sceneScripts}, fit=${settings.fit}`,
+                attempts: attempts.slice(),
+                diag: diag.slice(),
+            };
+        };
+
+        /*
+         * 三层都失败：不再退官方预览图（那只是几百像素的 GIF），直接说清楚并给出出路。
+         * 背景层本身是 pointer-events:none，错误卡用 pointer-events:auto 单独放开。
+         */
+        const showSceneError = (item) => {
+            clearSceneError();
+            teardownMedia();
+            currentKey = null;
+            paintReadability(0.06);
+
+            const report = buildFailureReport(item);
+            lastErrorReport = report;
+
+            const wrap = document.createElement('div');
+            wrap.className = 'wp-eng-error';
+            const card = document.createElement('div');
+            card.className = 'wp-eng-error-card';
+
+            const title = document.createElement('div');
+            title.className = 'wp-eng-error-title';
+            title.textContent = '这张场景壁纸没能加载';
+            const sub = document.createElement('div');
+            sub.className = 'wp-eng-error-sub';
+            sub.textContent = `${item.title}：实时渲染、合成静态图、单张原画都失败了。`;
+            const status = document.createElement('div');
+            status.className = 'wp-eng-error-status';
+
+            const actions = document.createElement('div');
+            actions.className = 'wp-eng-error-actions';
+            const makeButton = (text, onClick) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = text;
+                button.addEventListener('click', onClick);
+                return button;
+            };
+            actions.append(
+                makeButton('导出错误日志', () => {
+                    status.textContent = downloadErrorLog(report)
+                        ? '日志已导出到下载文件夹'
+                        : '导出失败，可到「更多设置」里再试';
+                }),
+                makeButton('提交 Issue', () => {
+                    status.textContent = openIssuePage(report)
+                        ? '已打开仓库的 issue 页面，请把日志文件拖进去'
+                        : '打开失败，可手动访问仓库的 Issues';
+                }),
+                makeButton('重试', () => {
+                    clearSceneError();
+                    render().catch(() => undefined);
+                }),
+            );
+
+            card.append(title, sub, actions, status);
+            wrap.append(card);
+            root.append(wrap);
+            sceneErrorCard = wrap;
+            notifyPanel();
+        };
+
+        /*
+         * 网页壁纸用 iframe 渲染。WE 的网页 API 由本地服务注入的垫片提供，
+         * 这里把频谱与「正在播放」用 postMessage 推给它（iframe 是跨源的，
+         * 只能走 postMessage）。
+         */
+        const pumpWebFrame = (frame) => {
+            const left = new Float32Array(64);
+            const right = new Float32Array(64);
+            const post = (payload) => {
+                try {
+                    frame.contentWindow?.postMessage(payload, '*');
+                } catch {
+                    /* iframe 还没就绪 */
+                }
+            };
+            const audioStop = typeof context.every === 'function'
+                ? context.every(33, () => {
+                    // 暂停时的衰减由 fillAudioFrames 统一处理
+                    fillAudioFrames(left, right);
+                    post({ __foliaWe: 1, kind: 'audio', values: Array.from(left).concat(Array.from(right)) });
+                })
+                : null;
+
+            const sendMedia = () => {
+                let state = null;
+                try {
+                    state = folium.playback?.getState?.() ?? null;
+                } catch {
+                    state = null;
+                }
+                const song = state?.song ?? null;
+                let cover = null;
+                try {
+                    cover = context.getCoverUrl?.() ?? null;
+                } catch {
+                    cover = null;
+                }
+                const playing = state?.state === 'playing';
+                post({
+                    __foliaWe: 1,
+                    kind: 'media',
+                    media: {
+                        title: song?.title ?? '',
+                        artist: song?.artist ?? '',
+                        album: song?.album ?? '',
+                        albumArtist: song?.artist ?? '',
+                        position: Number(state?.position) || 0,
+                        duration: Number(state?.duration) || 0,
+                        state: playing ? 1 : state?.state === 'paused' ? 2 : 0,
+                        ...(cover ? { thumbnail: cover, hasThumbnail: true } : { hasThumbnail: false }),
+                    },
+                });
+            };
+            sendMedia();
+            const mediaStop = typeof context.every === 'function' ? context.every(1000, sendMedia) : null;
+
+            return () => {
+                try {
+                    audioStop?.();
+                } catch {
+                    /* 已释放 */
+                }
+                try {
+                    mediaStop?.();
+                } catch {
+                    /* 已释放 */
+                }
+            };
+        };
+
+        const paintWebFrame = (item, settings) => {
+            const frame = document.createElement('iframe');
+            frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms');
+            // 不给 autoplay 授权：壁纸自带 BGM 不该出声（垫片里还会再钉一次静音）
+            frame.setAttribute('allow', 'fullscreen');
+            frame.referrerPolicy = 'no-referrer';
+            if (item.preview) {
+                const poster = document.createElement('img');
+                poster.src = httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview) ?? '';
+                poster.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
+                mediaWrap.append(poster);
+                poster.addEventListener('error', () => {
+                    poster.remove();
+                }, { once: true });
+            }
+            frame.addEventListener('load', () => frame.classList.add('wp-eng-ready'), { once: true });
+            frame.src = httpUrl(library, item, item.file) ?? 'about:blank';
+            media = frame;
+            mediaWrap.append(frame);
+            const stopPump = pumpWebFrame(frame);
+            cleanupMedia = () => {
+                try {
+                    stopPump();
+                } catch {
+                    /* 已释放 */
+                }
+                frame.src = 'about:blank';
+            };
+            startMotion();
+            refreshReadability();
+        };
+
+        /*
+         * 背景选择器里的「悬停预览」会把背景挂载起来拍一张快照。
+         * 对场景壁纸来说这等于每次都起一个 WebGL 引擎去解析几十 MB 的包，
+         * 鼠标划过去就卡一下。这里通过容器形态把它认出来，只画一张静态图。
+         */
+        const isPreviewSurface = () => {
+            if (context.staticMode === true) {
+                return true;
+            }
+            const element = container;
+            if (!element || element.isConnected === false) {
+                return true;
+            }
+            const width = Number(element.clientWidth) || 0;
+            const height = Number(element.clientHeight) || 0;
+            if (width > 0 && height > 0 && (width < 420 || height < 240)) {
+                return true;
+            }
+            try {
+                const style = typeof window !== 'undefined' && window.getComputedStyle
+                    ? window.getComputedStyle(element)
+                    : null;
+                if (style) {
+                    if (style.visibility === 'hidden' || style.display === 'none') {
+                        return true;
+                    }
+                    const opacity = Number(style.opacity);
+                    if (Number.isFinite(opacity) && opacity === 0) {
+                        return true;
+                    }
+                }
+                const rect = element.getBoundingClientRect?.();
+                if (rect && typeof rect.bottom === 'number' && typeof window !== 'undefined') {
+                    if (rect.bottom <= 0 || rect.right <= 0
+                        || rect.top >= (window.innerHeight || 0) || rect.left >= (window.innerWidth || 0)) {
+                        return true;
+                    }
+                }
+            } catch {
+                /* 取不到样式就按正式背景处理 */
+            }
+            return false;
+        };
+
+        /* 预览用的廉价渲染：只要能看出是什么就行，不启动引擎 */
+        const paintPreviewStill = (item) => {
+            const url = item.custom
+                ? null
+                : (httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview));
+            if (url) {
+                const image = document.createElement('img');
+                image.src = url;
+                image.style.objectFit = 'cover';
+                media = image;
+                mediaWrap.append(image);
+                cleanupMedia = () => {
+                    image.removeAttribute('src');
+                };
+                return true;
+            }
+            const art = item.custom ? item.url : artUrl(library, item);
+            if (art) {
+                const image = document.createElement('img');
+                image.src = art;
+                image.style.objectFit = 'cover';
+                media = image;
+                mediaWrap.append(image);
+                cleanupMedia = () => {
+                    image.removeAttribute('src');
+                };
+                return true;
+            }
+            return false;
+        };
+
         const show = (item) => {
             if (!item) {
                 return;
             }
             const settings = context.getSettings();
+
+            // 自定义背景：URL 由宿主的 file 协议给出，已经支持 Range，直接喂给媒体元素
+            if (item.custom) {
+                if (item.live === 'video') {
+                    const video = document.createElement('video');
+                    video.muted = true;
+                    video.loop = true;
+                    video.autoplay = true;
+                    video.playsInline = true;
+                    video.preload = 'auto';
+                    // 宿主的 folia-mod://_files 不返回 CORS 头，加 crossOrigin 反而会加载失败；
+                    // 代价是画布会被污染，没法采样亮度，改用中性估值
+                    video.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
+                    media = video;
+                    customMedia = true;
+                    mediaWrap.append(video);
+                    const onReady = () => {
+                        refreshReadability();
+                        if (context.isPaused() && settings.syncPause) {
+                            return;
+                        }
+                        video.play().catch(() => undefined);
+                    };
+                    // 容器能读、编码解不了（例如 avi / wmv）时给出明确提示，而不是留一块黑
+                    video.addEventListener('error', () => {
+                        info.textContent = `${item.title} · 这个视频格式解不了（支持 mp4 / m4v / webm / mov）`;
+                        info.classList.add('wp-eng-visible');
+                        paintReadability(0.34);
+                    }, { once: true });
+                    video.addEventListener('loadeddata', onReady);
+                    video.addEventListener('seeked', refreshReadability);
+                    video.src = item.url;
+                    cleanupMedia = () => {
+                        video.removeEventListener('loadeddata', onReady);
+                        video.removeEventListener('seeked', refreshReadability);
+                        video.removeAttribute('src');
+                        video.load();
+                    };
+                    return;
+                }
+
+                const image = document.createElement('img');
+                image.decoding = 'async';
+                image.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
+                image.addEventListener('error', () => {
+                    info.textContent = `${item.title} · 这个图片格式读不出来`;
+                    info.classList.add('wp-eng-visible');
+                    paintReadability(0.34);
+                }, { once: true });
+                media = image;
+                customMedia = true;
+                mediaWrap.append(image);
+                const onLoad = () => refreshReadability();
+                image.addEventListener('load', onLoad);
+                image.src = item.url;
+                cleanupMedia = () => {
+                    image.removeEventListener('load', onLoad);
+                };
+                return;
+            }
+
             const live = item.live;
             if (live === 'video' && item.file) {
                 const video = document.createElement('video');
@@ -1035,52 +2017,24 @@ export default function activate(folium) {
             }
 
             if (live === 'web' && item.file) {
-                const frame = document.createElement('iframe');
-                frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms');
-                frame.setAttribute('allow', 'autoplay; fullscreen');
-                frame.referrerPolicy = 'no-referrer';
-                // 底下先垫一张预览图，网页 wallapper 加载不出来时不会露出白板
-                if (item.preview) {
-                    const poster = document.createElement('img');
-                    poster.src = httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview) ?? '';
-                    poster.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
-                    mediaWrap.append(poster);
-                    poster.addEventListener('error', () => {
-                        poster.remove();
-                    }, { once: true });
-                }
-                frame.addEventListener('load', () => frame.classList.add('wp-eng-ready'), { once: true });
-                frame.src = httpUrl(library, item, item.file) ?? 'about:blank';
-                media = frame;
-                mediaWrap.append(frame);
-                cleanupMedia = () => {
-                    frame.src = 'about:blank';
-                };
-                refreshReadability();
+                paintWebFrame(item, settings);
                 return;
             }
 
-            // scene / application：先试合成整场，再退单张原图，最后退官方预览图
+            // 兜底只到「单张原画」为止；场景壁纸不再使用官方预览图（那只是几百像素的 GIF）
             const sources = [];
-            if (settings.sceneSource !== 'preview') {
-                const sharp = artUrl(library, item);
-                if (sharp) {
-                    sources.push({ url: sharp, sharp: true });
+            const sharpArt = artUrl(library, item);
+            if (sharpArt) {
+                sources.push({ url: sharpArt, sharp: true });
+            }
+            if (item.kind !== 'scene') {
+                const previewOverHttp = httpUrl(library, item, item.preview);
+                if (previewOverHttp) {
+                    sources.push({ url: previewOverHttp, sharp: false });
                 }
-            }
-            const previewOverHttp = httpUrl(library, item, item.preview);
-            if (previewOverHttp) {
-                sources.push({ url: previewOverHttp, sharp: false });
-            }
-            const previewOverFile = toFileUrl(item.absPreview);
-            if (previewOverFile) {
-                sources.push({ url: previewOverFile, sharp: false });
-            }
-            if (sources.length === 0) {
-                // 选了「预览」但这张没有预览图时，原图总比空着强
-                const sharp = artUrl(library, item);
-                if (sharp) {
-                    sources.push({ url: sharp, sharp: true });
+                const previewOverFile = toFileUrl(item.absPreview);
+                if (previewOverFile) {
+                    sources.push({ url: previewOverFile, sharp: false });
                 }
             }
 
@@ -1098,7 +2052,8 @@ export default function activate(folium) {
                 cleanupMedia = detach;
             };
 
-            if (item.kind === 'scene' && settings.sceneSource !== 'preview' && settings.sceneSource !== 'art') {
+            // 场景壁纸：实时渲染 → 合成静态图 → 单张原画；三层都不行就报错（不再退预览图）
+            if (item.kind === 'scene') {
                 let cancelled = false;
                 stopLive = [];
                 const runStops = () => {
@@ -1113,26 +2068,41 @@ export default function activate(folium) {
                     });
                 };
                 const run = async () => {
-                    let ready = false;
-                    if (settings.sceneSource === 'live') {
-                        ready = await liveScene(item, settings, () => cancelled || disposed, (stop) => {
-                            if (stopLive) {
-                                stopLive.push(stop);
-                            } else {
-                                stop();
-                            }
-                        });
+                    const liveOk = await liveScene(item, settings, () => cancelled || disposed, (stop) => {
+                        if (stopLive) {
+                            stopLive.push(stop);
+                        } else {
+                            stop();
+                        }
+                    });
+                    let fallback = null;
+                    if (!liveOk && !cancelled && !disposed) {
+                        fallback = await compositeScene(item, () => cancelled || disposed) ? '合成静态图' : null;
                     }
-                    if (!ready) {
-                        ready = await compositeScene(item, () => cancelled || disposed);
+                    if (!liveOk && !fallback && !cancelled && !disposed) {
+                        fallback = await paintSceneArt(item, () => cancelled || disposed) ? '单张原画' : null;
                     }
-                    if (!ready && !cancelled && !disposed) {
-                        paintStill();
+                    if (cancelled || disposed) {
+                        return;
+                    }
+                    if (liveOk || fallback) {
+                        lastErrorReport = null;
+                    }
+                    if (!liveOk && fallback) {
+                        // 实时渲染没成，但画面还有：顶部提示一次，5 秒后自己收
+                        showSceneToast(item, fallback);
+                        return;
+                    }
+                    // 只有三层全都没成才报错。liveOk 时 fallback 本来就是 null，
+                    // 之前写成 `if (!fallback)` 会把渲染成功的场景也拆掉换成错误卡。
+                    if (!liveOk && !fallback) {
+                        showSceneError(item);
                     }
                 };
-                run().catch(() => {
+                run().catch((error) => {
+                    pushDiag('加载流程', `未捕获的异常：${error?.message ?? error}`);
                     if (!cancelled && !disposed) {
-                        paintStill();
+                        showSceneError(item);
                     }
                 });
                 cleanupMedia = () => {
@@ -1156,6 +2126,80 @@ export default function activate(folium) {
             if (disposed) {
                 return;
             }
+            clearSceneError();
+            clearSceneToast();
+            const settings = context.getSettings();
+
+            // 选择器预览：不碰引擎，只铺一张静态图
+            if (isPreviewSurface()) {
+                const previewSelection = await readState();
+                let previewItem;
+                if (settings.library === 'custom') {
+                    library = null;
+                    previewItem = chooseCustom(await resolveCustom(false), settings, context, previewSelection);
+                } else {
+                    library = await loadLibrary(false);
+                    previewItem = chooseWallpaper(library, settings, context, previewSelection);
+                }
+                if (disposed) {
+                    return;
+                }
+                if (!previewItem) {
+                    return;
+                }
+                const previewKey = `preview:${previewItem.id ?? previewItem.grantId}`;
+                if (previewKey === currentKey) {
+                    return;
+                }
+                currentKey = previewKey;
+                teardownMedia();
+                paintPreviewStill({
+                    ...previewItem,
+                    custom: Boolean(previewItem.grantId),
+                    url: previewItem.url,
+                });
+                return;
+            }
+            selection = await readState();
+            if (disposed) {
+                return;
+            }
+
+            if (settings.library === 'custom') {
+                const entries = await resolveCustom(false);
+                if (disposed) {
+                    return;
+                }
+                library = null;
+                const choice = chooseCustom(entries, settings, context, selection);
+                if (!choice) {
+                    teardownMedia();
+                    currentKey = null;
+                    paintReadability(0.06);
+                    info.textContent = '我的文件：还没添加图片或视频（右侧「更多设置」里添加）';
+                    info.classList.add('wp-eng-visible');
+                    return;
+                }
+                const item = {
+                    id: `custom:${choice.grantId}`,
+                    title: choice.name,
+                    live: choice.kind === 'video' ? 'video' : 'image',
+                    custom: true,
+                    url: choice.url,
+                };
+                info.classList.remove('wp-eng-visible');
+                info.textContent = formatCaption(item, false);
+                if (item.id === currentKey && media) {
+                    applyFilters();
+                    return;
+                }
+                currentKey = item.id;
+                teardownMedia();
+                show(item);
+                applyFilters();
+                return;
+            }
+
             library = await loadLibrary(false);
             if (disposed) {
                 return;
@@ -1164,7 +2208,6 @@ export default function activate(folium) {
             if (disposed) {
                 return;
             }
-            const settings = context.getSettings();
             const item = chooseWallpaper(library, settings, context, selection);
             if (!item) {
                 paintReadability(0.06);
@@ -1178,39 +2221,57 @@ export default function activate(folium) {
                 return;
             }
             currentKey = item.id;
-            panVariant = fnv1a(item.id);
             teardownMedia();
             show(item);
             applyFilters();
         };
 
         const formatCaption = (item, mode) => {
-            const kindText = item.live === 'video'
-                ? '视频'
-                : item.live === 'web'
-                    ? '网页'
-                    : mode === 'live'
-                        ? '实时场景'
-                        : mode === 'composited'
-                            ? '合成场景'
-                            : mode === 'art' ? '原画' : '预览图';
+            const kindText = item.custom
+                ? (item.live === 'video' ? '我的视频' : '我的图片')
+                : item.live === 'video'
+                    ? '视频'
+                    : item.live === 'web'
+                        ? '网页'
+                        : mode === 'live'
+                            ? '实时场景'
+                            : mode === 'composited'
+                                ? '合成场景'
+                                : mode === 'art' ? '原画' : '预览图';
             return `${item.title} · ${kindText}`;
         };
 
+        /*
+         * 防抖：设置面板里拖滑杆、壁纸选择器里连续换项都会连着触发通知，
+         * 每一次都重挂一个引擎就是「切壁纸卡一下」的主要来源。
+         */
+        let renderTimer = 0;
+        const scheduleRender = () => {
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+            }
+            renderTimer = setTimeout(() => {
+                renderTimer = 0;
+                render().catch((error) => console.warn('[壁纸引擎] 更新失败', error));
+            }, 160);
+        };
+
         const onSelectionChange = () => {
-            render().catch((error) => console.warn('[壁纸引擎] 切换壁纸失败', error));
+            scheduleRender();
         };
         listeners.add(onSelectionChange);
 
         render().catch((error) => console.warn('[壁纸引擎] 挂载失败', error));
 
-        // 设置变了、切歌了、播放/暂停了，宿主都会通过 subscribe 通知：
-        // 一次性交给 render —— 它会比对当前壁纸，只做必要的重挂载。
-        const stopSettings = typeof context.subscribe === 'function'
-            ? context.subscribe(() => {
-                render().catch((error) => console.warn('[壁纸引擎] 更新失败', error));
-            })
-            : null;
+        /*
+         * 设置变了、切歌了、播放/暂停了，宿主都会通知。
+         * Folium 2 把 ctx.subscribe 改名成 ctx.onChange（旧名会打弃用警告），
+         * 这里优先用新名，老宿主上再退回旧名。
+         */
+        const contextOnChange = typeof context.onChange === 'function'
+            ? context.onChange
+            : (typeof context.subscribe === 'function' ? context.subscribe : null);
+        const stopSettings = contextOnChange ? contextOnChange.call(context, scheduleRender) : null;
 
         // 场景的鼠标视差：把窗口指针位置喂给引擎（u/v 归一化）
         const onPointerMove = (event) => {
@@ -1240,6 +2301,13 @@ export default function activate(folium) {
         });
 
         const stopResize = context.onResize((size) => {
+            // 预览容器被撑成正式尺寸（或反过来）时，需要重新决定走哪条路径
+            const previewNow = isPreviewSurface();
+            const previewRendered = typeof currentKey === 'string' && currentKey.startsWith('preview:');
+            if (previewNow !== previewRendered) {
+                scheduleRender();
+                return;
+            }
             if (size.width > 0 && size.height > 0) {
                 refreshReadability();
             }
@@ -1274,6 +2342,12 @@ export default function activate(folium) {
             } catch {
                 /* 已经释放 */
             }
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = 0;
+            }
+            clearSceneError();
+            clearSceneToast();
             teardownMedia();
             style.remove();
             root.remove();
@@ -1308,6 +2382,13 @@ export default function activate(folium) {
             .wp-eng-field input[type="range"] { grid-column: 1 / -1; width: 100%; }
             .wp-eng-field .wp-eng-value { font-size: 11px; font-variant-numeric: tabular-nums; opacity: 0.6; }
             .wp-eng-empty { padding: 18px 12px; text-align: center; font-size: 11.5px; opacity: 0.6; line-height: 1.8; }
+            .wp-eng-card .wp-eng-del {
+                position: absolute; top: 4px; left: 4px; width: 18px; height: 18px; padding: 0;
+                border: 0; border-radius: 999px; cursor: pointer; line-height: 1;
+                background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 12px;
+            }
+            .wp-eng-card video { width: 100%; height: 100%; object-fit: cover; display: block; }
+            .wp-eng-card.wp-eng-missing { opacity: 0.45; }
         `;
         const root = document.createElement('div');
         root.className = 'wp-eng-panel';
@@ -1417,7 +2498,87 @@ export default function activate(folium) {
             }
         };
 
+        /* 场景加载失败的常驻提示：背景上的按钮点不到时，这里也能导出日志 */
+        const paintErrorBanner = (colors) => {
+            const report = lastErrorReport;
+            if (!report) {
+                return;
+            }
+            const box = el('div', {
+                style: `border: 1px solid ${mix(colors.text, -0.72)}; background: ${mix(colors.text, -0.9)}; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;`,
+            });
+            box.append(el('div', {
+                style: `font-size: 12px; font-weight: 600; color: ${colors.text};`,
+                text: '场景壁纸加载失败',
+            }));
+            box.append(el('div', {
+                className: 'wp-eng-hint',
+                text: `${report.title}：实时渲染、合成静态图、单张原画都失败了。${report.diag.length} 条诊断已记录。`,
+            }));
+            const actions = el('div', { className: 'wp-eng-row' });
+            const exportBtn = el('button', {
+                className: 'wp-eng-btn',
+                text: '导出错误日志',
+                style: `background: ${mix(colors.text, -0.78)}; color: ${colors.text};`,
+            });
+            const issueBtn = el('button', {
+                className: 'wp-eng-btn',
+                text: '提交 Issue',
+                style: `background: transparent; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.72)};`,
+            });
+            const dismiss = el('button', {
+                className: 'wp-eng-btn',
+                text: '收起',
+                style: `background: transparent; color: ${colors.muted};`,
+            });
+            exportBtn.addEventListener('click', () => {
+                state.message = downloadErrorLog(report) ? '日志已导出到下载文件夹' : '导出失败';
+                paint();
+            });
+            issueBtn.addEventListener('click', () => {
+                state.message = openIssuePage(report)
+                    ? '已打开仓库的 issue 页面，请把日志文件拖进去'
+                    : '打开失败，可手动访问仓库的 Issues';
+                paint();
+            });
+            dismiss.addEventListener('click', () => {
+                lastErrorReport = null;
+                paint();
+            });
+            actions.append(exportBtn, issueBtn, dismiss);
+            box.append(actions);
+            root.append(box);
+        };
+
         const paintWallpaperTab = (colors, settings) => {
+            // 先选来源：壁纸引擎库，还是自己添加的图片 / 视频
+            const sources = [
+                ['we', '壁纸引擎库'],
+                ['custom', '我的文件'],
+            ];
+            const sourceSeg = el('div', { className: 'wp-eng-seg', style: `background: ${mix(colors.text, -0.88)};` });
+            sources.forEach(([value, text]) => {
+                const button = el('button', {
+                    text,
+                    style: (settings.library ?? 'we') === value
+                        ? `background: ${mix(colors.text, -0.72)}; color: ${colors.text};`
+                        : `color: ${colors.muted};`,
+                });
+                button.addEventListener('click', () => {
+                    panelContext.settings.set({ library: value });
+                    paint();
+                });
+                sourceSeg.append(button);
+            });
+            root.append(sourceSeg);
+
+            paintErrorBanner(colors);
+
+            if ((settings.library ?? 'we') === 'custom') {
+                paintCustomTab(colors, settings);
+                return;
+            }
+
             const modes = [
                 ['random', '伪随机'],
                 ['fixed', '指定'],
@@ -1575,9 +2736,136 @@ export default function activate(folium) {
             }));
         };
 
+        /*
+         * 「我的文件」页：添加 / 删除自己的图片与视频。
+         * 文件通过宿主的系统对话框选择，模组只拿到会话 URL 与可跨重启恢复的 grantId，
+         * 看不到真实路径；文件被移走后，下次挂载会把对应条目自动剪掉。
+         */
+        const paintCustomTab = (colors, settings) => {
+            const box = el('div', { style: 'display: flex; flex-direction: column; gap: 10px;' });
+
+            const actions = el('div', { className: 'wp-eng-row' });
+            const addImage = el('button', {
+                className: 'wp-eng-btn',
+                text: '添加图片',
+                style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
+            });
+            const addVideo = el('button', {
+                className: 'wp-eng-btn',
+                text: '添加视频',
+                style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
+            });
+            const busy = () => state.busy;
+            addImage.addEventListener('click', () => pickCustom('image'));
+            addVideo.addEventListener('click', () => pickCustom('video'));
+            const addOther = el('button', {
+                className: 'wp-eng-btn',
+                text: '其他格式',
+                style: `background: transparent; color: ${colors.muted}; border: 1px solid ${mix(colors.text, -0.78)};`,
+                attrs: { title: 'bmp / svg / ico 等对话框里没有列出的扩展名' },
+            });
+            addOther.addEventListener('click', () => pickCustom('any'));
+            actions.append(addImage, addVideo, addOther);
+            box.append(actions);
+
+            const grid = el('div', { className: 'wp-eng-grid' });
+            box.append(grid);
+            root.append(box);
+
+            const entries = customCache ?? [];
+            if (entries.length === 0) {
+                grid.append(el('div', {
+                    className: 'wp-eng-empty',
+                    text: '还没有添加文件。\n点上面的按钮选图片或视频；它们会作为背景直接铺满播放页。',
+                }));
+            }
+
+            entries.forEach((entry) => {
+                const selected = entry.grantId === readSelection().customId;
+                const card = el('div', {
+                    className: 'wp-eng-card',
+                    style: `border-color: ${selected ? colors.accent : 'transparent'};`,
+                    attrs: { title: entry.name },
+                });
+
+                if (entry.kind === 'video') {
+                    const video = el('video', { attrs: { muted: '', playsinline: '', preload: 'metadata' } });
+                    video.muted = true;
+                    video.src = entry.url;
+                    card.append(video);
+                } else {
+                    const image = el('img', { attrs: { src: entry.url, loading: 'lazy' } });
+                    image.addEventListener('error', () => image.remove(), { once: true });
+                    card.append(image);
+                }
+
+                card.append(el('div', { className: 'wp-eng-kind', text: entry.kind === 'video' ? '视频' : '图片' }));
+                card.append(el('div', { className: 'wp-eng-name', text: entry.name }));
+
+                const del = el('button', { className: 'wp-eng-del', text: '×', attrs: { title: '移除这个文件' } });
+                del.addEventListener('click', async (event) => {
+                    event.stopPropagation();
+                    del.disabled = true;
+                    await removeCustomFile(entry.grantId);
+                    await resolveCustom(true);
+                    if (readSelection().customId === entry.grantId) {
+                        await writeState({ customId: null });
+                    }
+                    state.message = `已移除 ${entry.name}`;
+                    paint();
+                });
+                card.append(del);
+
+                card.addEventListener('click', async () => {
+                    await writeState({ customId: entry.grantId });
+                    if (panelContext.settings.get().mode !== 'fixed') {
+                        panelContext.settings.set({ mode: 'fixed' });
+                    }
+                    paint();
+                });
+                grid.append(card);
+            });
+
+            const modeHint = settings.mode === 'fixed'
+                ? '当前是「指定」：点一张卡片就用它。'
+                : settings.mode === 'desktop'
+                    ? '「跟随桌面」只对 Wallpaper Engine 有意义，这里会按伪随机抽。'
+                    : '当前是「伪随机」：按种子和切歌抽，点卡片可改成指定这一张。';
+            root.append(el('div', { className: 'wp-eng-hint', text: modeHint }));
+            root.append(el('div', {
+                className: 'wp-eng-hint',
+                text: '图片：PNG / JPG / WebP / GIF / AVIF（「其他格式」还能选 BMP / SVG / ICO / TIFF）；视频：MP4 / M4V / WebM / MOV / MKV（「其他格式」还能选 AVI / WMV / FLV / TS，能否播放取决于浏览器解码器）。文件只按路径引用，移动或删除后需要重新添加。',
+            }));
+        };
+
+        const pickCustom = async (kind) => {
+            if (state.busy) {
+                return;
+            }
+            state.busy = true;
+            state.message = '';
+            paint();
+            let added = null;
+            try {
+                added = await addCustomFile(kind);
+            } catch (error) {
+                state.message = `添加失败：${error && error.message ? error.message : error}`;
+            }
+            state.busy = false;
+            if (added) {
+                await resolveCustom(true);
+                await writeState({ customId: added.grantId });
+                if (panelContext.settings.get().mode !== 'fixed') {
+                    panelContext.settings.set({ mode: 'fixed' });
+                }
+                state.message = `已添加 ${added.name}`;
+            }
+            paint();
+        };
+
         const paintDisplayTab = (colors, settings) => {
             const schema = panelContext.settings.schema ?? [];
-            const skipped = new Set(['mode', 'seed', 'reshuffle', 'liveOnly']);
+            const skipped = new Set(['library', 'mode', 'seed', 'reshuffle', 'liveOnly']);
             const box = el('div', { style: 'display: flex; flex-direction: column; gap: 12px;' });
 
             schema.filter((field) => !skipped.has(field.key)).forEach((field) => {
@@ -1671,24 +2959,30 @@ export default function activate(folium) {
         };
 
         let selectionId = null;
+        let customId = null;
         const readSelectionId = () => selectionId;
+        const readSelection = () => ({ wallpaperId: selectionId, customId });
 
         const syncSelection = async () => {
             const stored = await readState();
             selectionId = stored.wallpaperId ?? null;
+            customId = stored.customId ?? null;
         };
 
         const onExternal = () => {
             readState().then((stored) => {
                 selectionId = stored.wallpaperId ?? null;
+                customId = stored.customId ?? null;
                 paint();
             }).catch(() => paint());
         };
-        listeners.add(onExternal);
+        panelListeners.add(onExternal);
 
         (async () => {
             await loadLibrary(false);
             await syncSelection();
+            // 打开面板时强制恢复一次：顺手把「文件已经不在了」的条目剪掉
+            await resolveCustom(true);
             if (!libraryCache?.items?.length) {
                 state.message = libraryCache?.error
                     ? `没读到壁纸库：${libraryCache.error}`
@@ -1698,7 +2992,7 @@ export default function activate(folium) {
         })().catch(() => paint());
 
         return () => {
-            listeners.delete(onExternal);
+            panelListeners.delete(onExternal);
             style.remove();
             root.remove();
         };

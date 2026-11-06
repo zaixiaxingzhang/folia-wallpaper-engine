@@ -12,6 +12,7 @@
 'use strict';
 
 const fs = require('fs');
+const { execFile } = require('child_process');
 const path = require('path');
 const http = require('http');
 
@@ -438,6 +439,139 @@ const sceneLayersFor = (item) => {
 // 只读文件服务
 // ---------------------------------------------------------------------------
 
+/*
+ * Wallpaper Engine 的网页 API 垫片。
+ *
+ * 网页壁纸（index.html 那类）靠 window.wallpaperRegisterAudioListener /
+ * wallpaperRegisterMedia*Listener 拿音频与曲目。这些 API 只有 WE 本体提供，
+ * 而我们的 iframe 是 http://127.0.0.1 的跨源页面，外部脚本注入不进去，
+ * 所以由本服务直接把垫片注入到返回的 HTML 里；数据由渲染端用 postMessage 推过来。
+ */
+const WE_SHIM_SOURCE = `(function () {
+    if (window.__foliaWeShim) { return; }
+    window.__foliaWeShim = true;
+    var audioCbs = [];
+    var propsCbs = [];
+    var playCbs = [];
+    var timeCbs = [];
+    var thumbCbs = [];
+    var statusCbs = [];
+    var last = { properties: null, playback: null, timeline: null, thumbnail: null, status: null };
+    function fire(list, payload) {
+        for (var i = 0; i < list.length; i += 1) {
+            try { list[i](payload); } catch (e) { }
+        }
+    }
+    function once(list, payload) {
+        for (var i = 0; i < list.length; i += 1) {
+            try { list[i](payload); } catch (e) { }
+        }
+    }
+    /*
+     * 壁纸自带的声音一律静音：有的网页壁纸带 BGM，选中后用户没法关掉。
+     * 这里在壁纸自己的脚本执行前就把媒体元素钉死为静音，并且拦掉 play()。
+     */
+    try {
+        var mproto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+        if (mproto) {
+            var rawPlay = mproto.play;
+            mproto.play = function () {
+                try { this.muted = true; this.volume = 0; } catch (e) { }
+                return rawPlay.apply(this, arguments);
+            };
+            var volumeDesc = Object.getOwnPropertyDescriptor(mproto, 'volume');
+            if (volumeDesc && volumeDesc.set) {
+                Object.defineProperty(mproto, 'volume', {
+                    configurable: true,
+                    get: volumeDesc.get,
+                    set: function () { volumeDesc.set.call(this, 0); }
+                });
+            }
+        }
+        var silence = function () {
+            var list = document.querySelectorAll ? document.querySelectorAll('audio,video') : [];
+            for (var i = 0; i < list.length; i += 1) {
+                try { list[i].muted = true; list[i].volume = 0; } catch (e) { }
+            }
+        };
+        silence();
+        if (document.documentElement && window.MutationObserver) {
+            new window.MutationObserver(silence).observe(document.documentElement, { childList: true, subtree: true });
+        }
+        document.addEventListener('DOMContentLoaded', silence);
+    } catch (e) { }
+
+    window.wallpaperMediaIntegration = { PLAYBACK_STOPPED: 0, PLAYBACK_PLAYING: 1, PLAYBACK_PAUSED: 2 };
+    window.wallpaperRegisterAudioListener = function (fn) {
+        if (typeof fn === 'function') { audioCbs.push(fn); }
+    };
+    window.wallpaperRegisterMediaPropertiesListener = function (fn) {
+        if (typeof fn !== 'function') { return; }
+        propsCbs.push(fn);
+        if (last.properties) { once([fn], last.properties); }
+    };
+    window.wallpaperRegisterMediaPlaybackListener = function (fn) {
+        if (typeof fn !== 'function') { return; }
+        playCbs.push(fn);
+        if (last.playback) { once([fn], last.playback); }
+    };
+    window.wallpaperRegisterMediaTimelineListener = function (fn) {
+        if (typeof fn !== 'function') { return; }
+        timeCbs.push(fn);
+        if (last.timeline) { once([fn], last.timeline); }
+    };
+    window.wallpaperRegisterMediaThumbnailListener = function (fn) {
+        if (typeof fn !== 'function') { return; }
+        thumbCbs.push(fn);
+        if (last.thumbnail) { once([fn], last.thumbnail); }
+    };
+    window.wallpaperRegisterMediaStatusListener = function (fn) {
+        if (typeof fn !== 'function') { return; }
+        statusCbs.push(fn);
+        if (last.status) { once([fn], last.status); }
+    };
+    window.addEventListener('message', function (event) {
+        var data = event.data;
+        if (!data || data.__foliaWe !== 1) { return; }
+        if (data.kind === 'audio' && data.values) {
+            fire(audioCbs, data.values);
+            return;
+        }
+        if (data.kind === 'media' && data.media) {
+            var m = data.media;
+            last.properties = { title: m.title, artist: m.artist, albumTitle: m.album, albumArtist: m.albumArtist, subTitle: m.artist };
+            last.playback = { state: m.state };
+            last.timeline = { position: m.position, duration: m.duration };
+            last.status = { state: m.state };
+            if (m.thumbnail) { last.thumbnail = { thumbnail: m.thumbnail }; }
+            fire(propsCbs, last.properties);
+            fire(playCbs, last.playback);
+            fire(timeCbs, last.timeline);
+            fire(statusCbs, last.status);
+            if (last.thumbnail) { fire(thumbCbs, last.thumbnail); }
+        }
+    });
+    try { parent.postMessage({ __foliaWeReady: 1 }, '*'); } catch (e) { }
+})();`;
+
+const shimBytes = Buffer.from(WE_SHIM_SOURCE, 'utf8');
+
+/* 把垫片塞到 <head> 最前面，保证壁纸自己的脚本执行时这些 API 已经就位 */
+const injectShim = (html) => {
+    const tag = '<script src="/we-shim.js"></script>';
+    const headMatch = /<head[^>]*>/i.exec(html);
+    if (headMatch) {
+        const at = headMatch.index + headMatch[0].length;
+        return html.slice(0, at) + tag + html.slice(at);
+    }
+    const htmlMatch = /<html[^>]*>/i.exec(html);
+    if (htmlMatch) {
+        const at = htmlMatch.index + htmlMatch[0].length;
+        return html.slice(0, at) + tag + html.slice(at);
+    }
+    return tag + html;
+};
+
 const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
     let stat;
     try {
@@ -460,6 +594,26 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'private, max-age=300',
     };
+
+    // HTML 需要改写（注入垫片），整份读出来发，不走 Range
+    if (path.extname(filePath).toLowerCase() === '.html' || path.extname(filePath).toLowerCase() === '.htm') {
+        let html = '';
+        try {
+            html = fs.readFileSync(filePath, 'utf8');
+        } catch {
+            response.writeHead(500, { 'Cache-Control': 'no-store' });
+            response.end('Read failed');
+            return;
+        }
+        const body = Buffer.from(injectShim(html), 'utf8');
+        response.writeHead(200, {
+            ...headers,
+            'Content-Type': 'text/html; charset=utf-8',
+            'Content-Length': String(body.length),
+        });
+        response.end(request.method === 'HEAD' ? undefined : body);
+        return;
+    }
 
     const range = allowRange ? /^bytes=(\d*)-(\d*)$/.exec(request.headers.range ?? '') : null;
     if (range && (range[1] || range[2])) {
@@ -518,6 +672,18 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                     'Cache-Control': 'no-store',
                 });
                 response.end(JSON.stringify({ ok: true, count: library?.items?.length ?? 0 }));
+                return;
+            }
+
+            // WE 网页 API 垫片（被注入到网页壁纸的 HTML 里）
+            if (url.pathname === '/we-shim.js') {
+                response.writeHead(200, {
+                    'Content-Type': 'text/javascript; charset=utf-8',
+                    'Content-Length': String(shimBytes.length),
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'private, max-age=3600',
+                });
+                response.end(request.method === 'HEAD' ? undefined : shimBytes);
                 return;
             }
 
@@ -745,6 +911,40 @@ module.exports = function activate(api) {
     api.rpc.handle('library', (options) => payload(options && options.refresh === true));
 
     // 兜底：渲染端第一次拿到 base 之前先要知道端口
+    /*
+     * 用系统默认浏览器打开链接。
+     * 渲染端 window.open 会在 Folia 自己的窗口里开标签页，那里没有浏览器登录态，
+     * 用户得重新登录 GitHub；所以交给操作系统去开。
+     * 只放行本模组自己生成的 GitHub issue 链接。
+     */
+    api.rpc.handle('openExternal', async (options) => {
+        let parsed;
+        try {
+            parsed = new URL(String(options?.url ?? ''));
+        } catch {
+            return { ok: false, error: 'bad-url' };
+        }
+        if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') {
+            return { ok: false, error: 'url-not-allowed' };
+        }
+        const target = parsed.href;
+        return await new Promise((resolve) => {
+            const done = (error) => resolve(error ? { ok: false, error: String(error.message ?? error) } : { ok: true });
+            try {
+                if (process.platform === 'win32') {
+                    // rundll32 把 URL 当 argv 交给外壳，不经过 cmd，避免 & 被解释
+                    execFile('rundll32.exe', ['url.dll,FileProtocolHandler', target], { windowsHide: true }, done);
+                } else if (process.platform === 'darwin') {
+                    execFile('open', [target], done);
+                } else {
+                    execFile('xdg-open', [target], done);
+                }
+            } catch (error) {
+                done(error);
+            }
+        });
+    });
+
     api.rpc.handle('ping', () => ({ ok: true, base }));
 
     startServer(() => library).then((started) => {
