@@ -382,11 +382,6 @@ export default function activate(folium) {
             description: t('实时渲染场景的帧率上限；调低可省电、省 GPU', 'Frame-rate cap for live scenes; lower it to save power'),
         },
         {
-            key: 'sceneScripts', type: 'boolean', defaultValue: true,
-            label: t('运行壁纸脚本', 'Run wallpaper scripts'),
-            description: t('场景自带的 SceneScript（时钟、文字动画、属性联动）需要它；关掉更安全，但部分壁纸会僵在原位', 'Scene wallpapers use SceneScript for clocks, text animation and property wiring. Turning it off is safer but freezes those parts'),
-        },
-        {
             key: 'fit', type: 'select', defaultValue: 'cover',
             label: t('填充方式', 'Fit'),
             description: t('壁纸与窗口比例不一致时怎么摆', 'How the wallpaper is placed when its aspect ratio differs'),
@@ -1222,8 +1217,10 @@ export default function activate(folium) {
                     fps: Math.max(15, Math.min(60, Number(settings.sceneFps) || 30)),
                     volume: 0,
                     autoplay: true,
-                    // 部分壁纸靠 SceneScript 驱动时钟/文字/属性联动；关掉更安全但会僵住
-                    scripts: settings.sceneScripts !== false,
+                    // 永远不执行壁纸自带的 SceneScript：它来自创意工坊、不在签名范围里，
+                    // 而引擎用 new Function 求值，脚本能拿到宿主页面。脚本关掉后
+                    // 场景仍会跑图层动画、粒子、着色器，只是时钟/文字/属性联动停在快照值。
+                    scripts: false,
                     onError: (error) => {
                         // 引擎自己报的致命错误，原样记进日志（下次导出就能看到真正原因）
                         pushDiag('实时渲染', `引擎错误：${error?.message ?? error}`, 'error');
@@ -1673,7 +1670,7 @@ export default function activate(folium) {
                 folium: host.folium ? `${host.folium.major}.${host.folium.minor}` : '未知',
                 webgl: webglInfo(),
                 ua: typeof navigator !== 'undefined' ? navigator.userAgent : '未知',
-                settings: `sceneFps=${settings.sceneFps}, sceneScripts=${settings.sceneScripts}, fit=${settings.fit}`,
+                settings: `sceneFps=${settings.sceneFps}, scripts=off, fit=${settings.fit}`,
                 attempts: attempts.slice(),
                 diag: diag.slice(),
             };
@@ -1811,7 +1808,9 @@ export default function activate(folium) {
 
         const paintWebFrame = (item, settings) => {
             const frame = document.createElement('iframe');
-            frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms');
+            // 不给 allow-same-origin：壁纸页面拿不到本机服务的同源身份，
+            // 也就没法借它读别的壁纸文件
+            frame.setAttribute('sandbox', 'allow-scripts allow-pointer-lock allow-forms');
             // 不给 autoplay 授权：壁纸自带 BGM 不该出声（垫片里还会再钉一次静音）
             frame.setAttribute('allow', 'fullscreen');
             frame.referrerPolicy = 'no-referrer';

@@ -11,6 +11,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const { execFile } = require('child_process');
 const path = require('path');
@@ -557,8 +558,8 @@ const WE_SHIM_SOURCE = `(function () {
 const shimBytes = Buffer.from(WE_SHIM_SOURCE, 'utf8');
 
 /* 把垫片塞到 <head> 最前面，保证壁纸自己的脚本执行时这些 API 已经就位 */
-const injectShim = (html) => {
-    const tag = '<script src="/we-shim.js"></script>';
+const injectShim = (html, prefix) => {
+    const tag = `<script src="${prefix}/we-shim.js"></script>`;
     const headMatch = /<head[^>]*>/i.exec(html);
     if (headMatch) {
         const at = headMatch.index + headMatch[0].length;
@@ -572,7 +573,18 @@ const injectShim = (html) => {
     return tag + html;
 };
 
-const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
+/*
+ * CORS：以前一律回 `*`，于是本机任何网页都能跨站读这个服务。
+ * 现在只对 Origin: null（Folia 的 file:// 渲染进程、以及不带 allow-same-origin 的
+ * 沙箱 iframe）放行 —— 那正是需要读像素做取样的场景；正常网站带自己的 origin，拿不到。
+ */
+const corsHeaders = (request) => (
+    request.headers.origin === 'null'
+        ? { 'Access-Control-Allow-Origin': 'null', Vary: 'Origin' }
+        : {}
+);
+
+const serveFile = (request, response, filePath, { allowRange = true } = {}, tokenPrefix = '') => {
     let stat;
     try {
         stat = fs.statSync(filePath);
@@ -590,8 +602,8 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
     const headers = {
         'Content-Type': MIME[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream',
         'Accept-Ranges': 'bytes',
-        // canvas 取样（算歌词可读性）需要它，否则画布会被污染读不出像素
-        'Access-Control-Allow-Origin': '*',
+        // canvas 取样（算歌词可读性）需要 CORS；只对 file:// 页面放行
+        ...corsHeaders(request),
         'Cache-Control': 'private, max-age=300',
     };
 
@@ -605,7 +617,7 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
             response.end('Read failed');
             return;
         }
-        const body = Buffer.from(injectShim(html), 'utf8');
+        const body = Buffer.from(injectShim(html, tokenPrefix), 'utf8');
         response.writeHead(200, {
             ...headers,
             'Content-Type': 'text/html; charset=utf-8',
@@ -656,19 +668,32 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}) => {
  * 任何路径都会被限制在登记过的壁纸目录内。
  */
 const startServer = (getLibrary) => new Promise((resolve, reject) => {
+    /*
+     * 随机路径前缀。没有它，本机任何网页都能扫端口读壁纸列表和文件；
+     * 有了它，只有拿到 base 的渲染端（也就是模组自己）知道地址。
+     */
+    const token = crypto.randomBytes(16).toString('hex');
+    const tokenPrefix = `/${token}`;
     const server = http.createServer((request, response) => {
         try {
+            const url = new URL(request.url, 'http://127.0.0.1');
+            // 前缀不对一律 404，不泄露任何信息
+            if (url.pathname !== tokenPrefix && !url.pathname.startsWith(`${tokenPrefix}/`)) {
+                response.writeHead(404, { 'Cache-Control': 'no-store' });
+                response.end();
+                return;
+            }
             if (request.method !== 'GET' && request.method !== 'HEAD') {
                 response.writeHead(405, { 'Cache-Control': 'no-store' });
                 response.end();
                 return;
             }
-            const url = new URL(request.url, 'http://127.0.0.1');
+            url.pathname = url.pathname.slice(tokenPrefix.length) || '/';
             if (url.pathname === '/health') {
                 const library = getLibrary();
                 response.writeHead(200, {
                     'Content-Type': 'application/json; charset=utf-8',
-                    'Access-Control-Allow-Origin': '*',
+                    ...corsHeaders(request),
                     'Cache-Control': 'no-store',
                 });
                 response.end(JSON.stringify({ ok: true, count: library?.items?.length ?? 0 }));
@@ -680,7 +705,6 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 response.writeHead(200, {
                     'Content-Type': 'text/javascript; charset=utf-8',
                     'Content-Length': String(shimBytes.length),
-                    'Access-Control-Allow-Origin': '*',
                     'Cache-Control': 'private, max-age=3600',
                 });
                 response.end(request.method === 'HEAD' ? undefined : shimBytes);
@@ -710,7 +734,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 });
                 response.writeHead(manifest ? 200 : 404, {
                     'Content-Type': 'application/json; charset=utf-8',
-                    'Access-Control-Allow-Origin': '*',
+                    ...corsHeaders(request),
                     'Cache-Control': 'no-store',
                 });
                 response.end(body);
@@ -741,7 +765,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 response.writeHead(200, {
                     'Content-Type': layer.mime,
                     'Content-Length': String(layer.length),
-                    'Access-Control-Allow-Origin': '*',
+                    ...corsHeaders(request),
                     'Cache-Control': 'private, max-age=3600',
                 });
                 if (request.method === 'HEAD') {
@@ -766,14 +790,14 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 const item = library?.items?.find((entry) => entry.id === itemId);
                 const art = item ? sceneArtFor(item) : null;
                 if (!art) {
-                    response.writeHead(404, { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+                    response.writeHead(404, { 'Cache-Control': 'no-store' });
                     response.end('No art');
                     return;
                 }
                 const headers = {
                     'Content-Type': art.mime,
                     'Content-Length': String(art.body.length),
-                    'Access-Control-Allow-Origin': '*',
+                    ...corsHeaders(request),
                     'Accept-Ranges': 'bytes',
                     'Cache-Control': 'private, max-age=3600',
                 };
@@ -825,7 +849,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 response.end('Forbidden');
                 return;
             }
-            serveFile(request, response, target);
+            serveFile(request, response, target, {}, tokenPrefix);
         } catch (error) {
             try {
                 response.writeHead(500, { 'Cache-Control': 'no-store' });
@@ -839,7 +863,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
         const address = server.address();
-        resolve({ server, port: address.port, base: `http://127.0.0.1:${address.port}` });
+        resolve({ server, port: address.port, token, base: `http://127.0.0.1:${address.port}/${token}` });
     });
 });
 
