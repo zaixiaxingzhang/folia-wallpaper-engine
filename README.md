@@ -69,10 +69,16 @@
   属性联动停在 `scene.json` 的快照值；图层动画、粒子、着色器照常运行。
 - **本机服务带随机路径前缀**：每次启动生成 32 位十六进制 token，所有接口都在
   `/<token>/…` 下；没有 token 一律 404，别的网页扫端口也读不到。
-- **CORS 只对 `Origin: null` 放行**（Folia 的 `file://` 渲染端与沙箱 iframe），
+- **CORS 只对 `Origin: null` 放行**（Folia 的 `file://` 渲染端），
   普通网站拿不到跨站读取权限。
-- **网页壁纸的 iframe 不带 `allow-same-origin`**，拿不到本机服务的同源身份，
-  也就没法借它读别的壁纸文件。
+- **每张网页壁纸运行在自己的临时 origin**：主进程单独起一个临时端口，只挂载它自己的目录，
+  并带随机路径；卸载时立即关闭。它和主服务不同端口，读不到壁纸列表、别的壁纸，也碰不到
+  Folia 页面。
+- **网页壁纸保留 `allow-same-origin`**：浏览器在 opaque origin 下会禁用
+  `localStorage` / `IndexedDB`，去掉会让 Unity 这类壁纸白屏。隔离靠独立端口与单目录挂载，
+  不靠 opaque origin。
+- **网页壁纸带 CSP**：`connect-src 'self'`、`img-src 'self' data: blob:` 等，
+  外网请求和其他本机端口发不出去；本地资源、Worker、WebAssembly 与音频响应照常。
 
 ## 权限
 

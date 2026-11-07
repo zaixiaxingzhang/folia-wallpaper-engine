@@ -1,5 +1,23 @@
 # 更新日志
 
+## v1.2.2
+
+继续按 #130 审查意见整改。v1.2.1 里「去掉 `allow-same-origin`」的做法会让
+`localStorage` / `IndexedDB` 被浏览器禁用，Unity 等网页壁纸直接白屏；这一版换成
+「独立 origin」隔离，壁纸照常可用，同时仍然读不到主服务和别的壁纸。
+
+- **网页壁纸各自运行在独立的临时 origin**：主进程为每张网页壁纸单独起一个临时端口，
+  只挂载它自己的目录，并带一段随机路径。壁纸页面与主服务不同端口、不同 origin，
+  拿不到壁纸列表，也无法访问别的壁纸目录；卸载时端口立即关闭。
+- **保留 `allow-same-origin`**：浏览器只在真实 origin 下才提供
+  `localStorage` / `sessionStorage` / `IndexedDB`，去掉会让 Unity 这类壁纸白屏。
+  隔离由「不同端口 + 只挂一张壁纸」保证，而不是靠 opaque origin。
+- **网页壁纸加 CSP**：`connect-src 'self'`、`img-src 'self' data: blob:` 等，
+  外网请求和其他本机端口一律发不出去，页面数据带不走；本地资源、
+  Worker、WebAssembly 与音频响应照常。
+- 主服务的随机 token 与 `Origin: null` CORS 限制保持不变；网页壁纸不再接触主服务 token。
+
+
 ## v1.2.1
 
 安全审查整改（针对 #130 的审查意见），功能与 v1.2.0 一致，仅收紧执行与访问边界。
@@ -13,8 +31,8 @@
 - **去掉 `Access-Control-Allow-Origin: *`**。改为只在请求 `Origin: null`（Folia 的 `file://`
   渲染端、以及沙箱 iframe）时回 `null`，普通网站不再具备跨站读取能力。
   歌词可读性的 canvas 取样仍然可用（它就是 `file://` 页面发起的）。
-- **网页壁纸的 iframe 去掉 `allow-same-origin`**，壁纸页面拿不到本机服务的同源身份，
-  无法借同一个服务读取其他壁纸的文件。
+- **网页壁纸的 iframe 去掉 `allow-same-origin`**（v1.2.2 已改为独立 origin，见上；
+  该做法会让依赖本地存储的壁纸白屏，因此没有保留）。
 
 
 ## v1.2.0

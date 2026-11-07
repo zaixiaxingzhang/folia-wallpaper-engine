@@ -575,8 +575,8 @@ const injectShim = (html, prefix) => {
 
 /*
  * CORS：以前一律回 `*`，于是本机任何网页都能跨站读这个服务。
- * 现在只对 Origin: null（Folia 的 file:// 渲染进程、以及不带 allow-same-origin 的
- * 沙箱 iframe）放行 —— 那正是需要读像素做取样的场景；正常网站带自己的 origin，拿不到。
+ * 现在只对 Origin: null（Folia 的 file:// 渲染进程）放行 —— 那正是需要读像素做取样的
+ * 场景；正常网站和网页壁纸都带自己的 origin，拿不到。
  */
 const corsHeaders = (request) => (
     request.headers.origin === 'null'
@@ -584,7 +584,7 @@ const corsHeaders = (request) => (
         : {}
 );
 
-const serveFile = (request, response, filePath, { allowRange = true } = {}, tokenPrefix = '') => {
+const serveFile = (request, response, filePath, { allowRange = true } = {}, tokenPrefix = '', documentHeaders = null) => {
     let stat;
     try {
         stat = fs.statSync(filePath);
@@ -620,6 +620,7 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}, toke
         const body = Buffer.from(injectShim(html, tokenPrefix), 'utf8');
         response.writeHead(200, {
             ...headers,
+            ...(documentHeaders ?? {}),
             'Content-Type': 'text/html; charset=utf-8',
             'Content-Length': String(body.length),
         });
@@ -658,6 +659,95 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}, toke
     }
     fs.createReadStream(filePath).pipe(response);
 };
+
+/*
+ * 网页壁纸页面的 CSP：只允许它自己的 origin（也就是这个临时端口）与 data/blob。
+ * 外网请求（CDN、在线 API）和别的本机端口都发不出去，即使壁纸脚本被换成恶意内容，
+ * 也没法把页面里的数据带走或去扫本机服务。
+ */
+const WEB_CSP = [
+    "default-src 'self' data: blob:",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self' data: blob:",
+    "worker-src 'self' blob:",
+    "frame-src 'self' blob:",
+    "object-src 'none'",
+    "form-action 'none'",
+    "base-uri 'self'",
+].join('; ');
+
+/*
+ * 网页壁纸服务：每张网页壁纸一个独立的临时 origin（自己的端口 + 随机路径），
+ * 只服务它自己的目录。
+ *
+ * 为什么不能去掉 allow-same-origin：Chromium 对 opaque origin 直接禁用
+ * localStorage / sessionStorage / cookie / IndexedDB，Unity、React 这类壁纸会白屏。
+ * 保留同源以后，隔离靠「不同端口 = 不同 origin」：它读不到主服务（端口不同、还要 token），
+ * 也读不到别的壁纸（这个端口下只挂当前壁纸的目录）。
+ */
+const startWebServer = (item) => new Promise((resolve, reject) => {
+    const token = crypto.randomBytes(16).toString('hex');
+    const tokenPrefix = `/${token}`;
+    const root = item.dir;
+    const server = http.createServer((request, response) => {
+        try {
+            const url = new URL(request.url, 'http://127.0.0.1');
+            if (url.pathname !== tokenPrefix && !url.pathname.startsWith(`${tokenPrefix}/`)) {
+                response.writeHead(404, { 'Cache-Control': 'no-store' });
+                response.end();
+                return;
+            }
+            if (request.method !== 'GET' && request.method !== 'HEAD') {
+                response.writeHead(405, { 'Cache-Control': 'no-store' });
+                response.end();
+                return;
+            }
+            url.pathname = url.pathname.slice(tokenPrefix.length) || '/';
+
+            if (url.pathname === '/we-shim.js') {
+                response.writeHead(200, {
+                    'Content-Type': 'text/javascript; charset=utf-8',
+                    'Content-Length': String(shimBytes.length),
+                    'Cache-Control': 'private, max-age=3600',
+                });
+                response.end(request.method === 'HEAD' ? undefined : shimBytes);
+                return;
+            }
+
+            const segments = url.pathname.split('/').filter(Boolean).map((segment) => decodeURIComponent(segment));
+            if (segments.length === 0
+                || segments.some((segment) => segment === '..' || segment === '.' || segment.includes('\\') || segment.includes('/') || path.isAbsolute(segment))) {
+                response.writeHead(400, { 'Cache-Control': 'no-store' });
+                response.end('Invalid path');
+                return;
+            }
+            const target = path.resolve(root, ...segments);
+            if (!target.startsWith(root + path.sep)) {
+                response.writeHead(403, { 'Cache-Control': 'no-store' });
+                response.end('Forbidden');
+                return;
+            }
+            serveFile(request, response, target, {}, tokenPrefix, { 'Content-Security-Policy': WEB_CSP });
+        } catch (error) {
+            try {
+                response.writeHead(500, { 'Cache-Control': 'no-store' });
+                response.end(String(error && error.message));
+            } catch {
+                /* 连接已经断了 */
+            }
+        }
+    });
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        const origin = `http://127.0.0.1:${address.port}`;
+        resolve({ server, token, origin, base: `${origin}/${token}`, dir: root });
+    });
+});
 
 /*
  * 启动 HTTP 服务。端口由系统分配（0），只监听 127.0.0.1，外部不可达。
@@ -877,6 +967,26 @@ module.exports = function activate(api) {
     let server = null;
     let lastScannedAt = 0;
 
+    // 网页壁纸的临时服务，按壁纸 id 复用；渲染端卸载时 release 掉
+    const webHosts = new Map();
+    const webStarting = new Map();
+
+    const closeWebHost = (id) => {
+        const host = webHosts.get(id);
+        if (!host) {
+            return;
+        }
+        webHosts.delete(id);
+        try {
+            host.server.close();
+        } catch {
+            /* 已经关了 */
+        }
+    };
+    const closeAllWebHosts = () => {
+        [...webHosts.keys()].forEach(closeWebHost);
+    };
+
     const ensureLibrary = (force) => {
         const fresh = !force && library && Date.now() - lastScannedAt < 60_000;
         if (fresh) {
@@ -934,6 +1044,63 @@ module.exports = function activate(api) {
 
     api.rpc.handle('library', (options) => payload(options && options.refresh === true));
 
+    /*
+     * 给网页壁纸拿一个属于自己的临时 origin。渲染端只用返回的 url 当 iframe.src，
+     * 卸载时调用 releaseWebFrame 关掉端口；同一张壁纸并发挂载会复用同一个服务。
+     */
+    api.rpc.handle('webFrame', async (options) => {
+        const id = String(options?.id ?? '');
+        if (!id) {
+            return { ok: false, error: 'bad-id' };
+        }
+        const current = ensureLibrary(false);
+        const item = current.items.find((entry) => entry.id === id);
+        if (!item || item.kind !== 'web' || item.live !== 'web' || !item.dir || !item.file) {
+            return { ok: false, error: 'not-a-web-wallpaper' };
+        }
+        let host = webHosts.get(id);
+        if (host && host.dir !== item.dir) {
+            closeWebHost(id);
+            host = null;
+        }
+        if (!host) {
+            let pending = webStarting.get(id);
+            if (!pending) {
+                pending = startWebServer(item).then((started) => {
+                    started.refs = 0;
+                    webHosts.set(id, started);
+                    webStarting.delete(id);
+                    return started;
+                }).catch((error) => {
+                    webStarting.delete(id);
+                    throw error;
+                });
+                webStarting.set(id, pending);
+            }
+            try {
+                host = await pending;
+            } catch (error) {
+                return { ok: false, error: String(error?.message ?? error) };
+            }
+        }
+        host.refs += 1;
+        const relative = item.file.split(/[\\/]/).filter(Boolean).map(encodeURIComponent).join('/');
+        return { ok: true, url: `${host.base}/${relative}`, origin: host.origin };
+    });
+
+    api.rpc.handle('releaseWebFrame', (options) => {
+        const id = String(options?.id ?? '');
+        const host = webHosts.get(id);
+        if (!host) {
+            return { ok: true };
+        }
+        host.refs = Math.max(0, (host.refs ?? 1) - 1);
+        if (host.refs === 0) {
+            closeWebHost(id);
+        }
+        return { ok: true };
+    });
+
     // 兜底：渲染端第一次拿到 base 之前先要知道端口
     /*
      * 用系统默认浏览器打开链接。
@@ -983,6 +1150,7 @@ module.exports = function activate(api) {
     });
 
     api.onDispose(() => {
+        closeAllWebHosts();
         if (server) {
             try {
                 server.close();
@@ -994,6 +1162,7 @@ module.exports = function activate(api) {
     });
 
     return () => {
+        closeAllWebHosts();
         if (server) {
             try {
                 server.close();

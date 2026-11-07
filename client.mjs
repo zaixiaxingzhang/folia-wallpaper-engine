@@ -1741,12 +1741,12 @@ export default function activate(folium) {
          * 这里把频谱与「正在播放」用 postMessage 推给它（iframe 是跨源的，
          * 只能走 postMessage）。
          */
-        const pumpWebFrame = (frame) => {
+        const pumpWebFrame = (frame, targetOrigin) => {
             const left = new Float32Array(64);
             const right = new Float32Array(64);
             const post = (payload) => {
                 try {
-                    frame.contentWindow?.postMessage(payload, '*');
+                    frame.contentWindow?.postMessage(payload, targetOrigin || '*');
                 } catch {
                     /* iframe 还没就绪 */
                 }
@@ -1808,9 +1808,13 @@ export default function activate(folium) {
 
         const paintWebFrame = (item, settings) => {
             const frame = document.createElement('iframe');
-            // 不给 allow-same-origin：壁纸页面拿不到本机服务的同源身份，
-            // 也就没法借它读别的壁纸文件
-            frame.setAttribute('sandbox', 'allow-scripts allow-pointer-lock allow-forms');
+            /*
+             * 每张网页壁纸由主进程单独起一个临时 origin（自己的端口 + 随机路径），
+             * 只服务它自己的目录。保留 allow-same-origin：浏览器只在真实 origin 下
+             * 才给 localStorage / IndexedDB，去掉以后 Unity 这类壁纸会直接白屏。
+             * 它和主服务不同端口，读不到壁纸列表、别的壁纸，也碰不到 Folia 页面。
+             */
+            frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock allow-forms');
             // 不给 autoplay 授权：壁纸自带 BGM 不该出声（垫片里还会再钉一次静音）
             frame.setAttribute('allow', 'fullscreen');
             frame.referrerPolicy = 'no-referrer';
@@ -1823,21 +1827,65 @@ export default function activate(folium) {
                     poster.remove();
                 }, { once: true });
             }
-            frame.addEventListener('load', () => frame.classList.add('wp-eng-ready'), { once: true });
-            frame.src = httpUrl(library, item, item.file) ?? 'about:blank';
-            media = frame;
-            mediaWrap.append(frame);
-            const stopPump = pumpWebFrame(frame);
-            cleanupMedia = () => {
+
+            let released = false;
+            let acquired = false;
+            let stopPump = null;
+            const releaseHost = () => {
                 try {
-                    stopPump();
+                    folium.rpc?.call?.('releaseWebFrame', { id: item.id })?.catch?.(() => {});
+                } catch {
+                    /* 主进程已经不在了 */
+                }
+            };
+            const release = () => {
+                if (released) {
+                    return;
+                }
+                released = true;
+                try {
+                    stopPump?.();
                 } catch {
                     /* 已释放 */
                 }
                 frame.src = 'about:blank';
+                if (acquired) {
+                    releaseHost();
+                }
             };
+            media = frame;
+            mediaWrap.append(frame);
+            cleanupMedia = release;
             startMotion();
             refreshReadability();
+
+            Promise.resolve()
+                .then(() => folium.rpc?.call?.('webFrame', { id: item.id }))
+                .then((host) => {
+                    if (!host?.ok || !host.url) {
+                        pushDiag('网页壁纸', `临时服务没有起来：${host?.error ?? '未知错误'}`, 'error');
+                        frame.remove();
+                        return;
+                    }
+                    acquired = true;
+                    if (released || disposed) {
+                        releaseHost();
+                        return;
+                    }
+                    frame.addEventListener('load', () => {
+                        if (released) {
+                            return;
+                        }
+                        frame.classList.add('wp-eng-ready');
+                        if (!stopPump) {
+                            stopPump = pumpWebFrame(frame, host.origin);
+                        }
+                    }, { once: true });
+                    frame.src = host.url;
+                })
+                .catch((error) => {
+                    pushDiag('网页壁纸', `临时服务请求失败：${error?.message ?? error}`, 'error');
+                });
         };
 
         /*
