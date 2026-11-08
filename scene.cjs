@@ -365,16 +365,287 @@ const buildSingleArt = (buffer, { minPixels = 800 * 450, requireAspect = [1.15, 
     return best;
 };
 
-/** 读一整个包（超过上限返回 null，避免把主进程内存顶爆） */
-const readPackage = (pkgPath, maxBytes = 256 * 1024 * 1024) => {
-    try {
-        const stat = fs.statSync(pkgPath);
-        if (stat.size > maxBytes) {
+// ---------------------------------------------------------------------------
+// 按需读取：主进程不能同步读大包，也不该为了取几张贴图把整个 scene.pkg 读进内存。
+// 先读包头的目录表，再按条目只读需要的 JSON / 贴图区间；句柄用完即关。
+// ---------------------------------------------------------------------------
+
+const readAt = async (handle, length, position) => {
+    const buffer = Buffer.alloc(length);
+    let offset = 0;
+    while (offset < length) {
+        const { bytesRead } = await handle.read(buffer, offset, length - offset, position + offset);
+        if (bytesRead <= 0) {
+            break;
+        }
+        offset += bytesRead;
+    }
+    if (offset === length) {
+        return buffer;
+    }
+    return offset > 0 ? buffer.subarray(0, offset) : null;
+};
+
+/*
+ * 目录表在文件开头，但表的大小没有单独字段。先读 256KB，解析失败就翻倍，
+ * 直到能解析或读到文件尾；正常包第一轮就够。
+ */
+const readTable = async (handle, size) => {
+    const maxWindow = Math.min(size, 16 * 1024 * 1024);
+    let window = Math.min(size, 256 * 1024);
+    while (window > 0) {
+        const buffer = await readAt(handle, window, 0);
+        if (!buffer) {
             return null;
         }
-        return { buffer: fs.readFileSync(pkgPath), stat };
+        const table = parsePackage(buffer);
+        if (table) {
+            return table;
+        }
+        if (window >= maxWindow) {
+            return null;
+        }
+        window = Math.min(maxWindow, window * 4);
+    }
+    return null;
+};
+
+const openPackage = async (pkgPath, maxBytes = 256 * 1024 * 1024) => {
+    try {
+        const stat = await fs.promises.stat(pkgPath);
+        if (!stat.isFile() || stat.size > maxBytes) {
+            return null;
+        }
+        const handle = await fs.promises.open(pkgPath, 'r');
+        const table = await readTable(handle, stat.size);
+        if (!table) {
+            await handle.close();
+            return null;
+        }
+        return { handle, stat, table };
     } catch {
         return null;
+    }
+};
+
+const closePackage = async (pkg) => {
+    try {
+        await pkg.handle.close();
+    } catch {
+        /* 已经关了 */
+    }
+};
+
+const entryBytes = (handle, table, entry) => readAt(handle, entry.length, table.base + entry.rel);
+
+const entryJson = async (handle, table, name) => {
+    const entry = table.entries.find((item) => item.name === name);
+    if (!entry) {
+        return null;
+    }
+    try {
+        const buffer = await entryBytes(handle, table, entry);
+        return buffer ? JSON.parse(buffer.toString('utf8')) : null;
+    } catch {
+        return null;
+    }
+};
+
+const textureEntryFor = (table, texture) => {
+    const stem = texture.split('/').pop();
+    return table.entries.find((entry) => {
+        const name = entry.name.toLowerCase();
+        if (!name.endsWith('.tex')) {
+            return false;
+        }
+        const bare = entry.name.slice(0, -4);
+        return bare === texture || bare.endsWith(`/${stem}`);
+    });
+};
+
+const scanTexture = async (handle, table, entry, options) => {
+    const buffer = await entryBytes(handle, table, entry);
+    if (!buffer) {
+        return null;
+    }
+    const found = findEmbeddedImage(buffer, 0, buffer.length, options);
+    if (!found) {
+        return null;
+    }
+    return { found, buffer, absolute: table.base + entry.rel + found.start };
+};
+
+/** 从文件还原图层清单，只读目录表、JSON 与候选贴图区间 */
+const buildSceneFile = async (pkgPath, { minPixels = 64 * 64 } = {}) => {
+    const pkg = await openPackage(pkgPath);
+    if (!pkg) {
+        return null;
+    }
+    const { handle, table } = pkg;
+    try {
+        const scene = await entryJson(handle, table, 'scene.json');
+        const objects = Array.isArray(scene?.objects) ? scene.objects : [];
+        if (objects.length === 0) {
+            return null;
+        }
+        const layers = [];
+        for (const [index, object] of objects.entries()) {
+            if (!object || object.visible === false || typeof object.image !== 'string' || !object.image.endsWith('.json')) {
+                continue;
+            }
+            const model = await entryJson(handle, table, object.image);
+            if (!model || typeof model.material !== 'string') {
+                continue;
+            }
+            const material = await entryJson(handle, table, model.material);
+            const passes = Array.isArray(material?.passes) ? material.passes : [];
+            let picked = null;
+            for (const pass of passes) {
+                if (!isPlainShader(pass?.shader)) {
+                    continue;
+                }
+                const textures = Array.isArray(pass?.textures) ? pass.textures : [];
+                for (const texture of textures) {
+                    if (typeof texture !== 'string' || texture.length === 0) {
+                        continue;
+                    }
+                    const texEntry = textureEntryFor(table, texture);
+                    if (!texEntry) {
+                        continue;
+                    }
+                    const scanned = await scanTexture(handle, table, texEntry, { minPixels, minBytesPerPixel: 0.01 });
+                    if (!scanned) {
+                        continue;
+                    }
+                    picked = { texEntry, ...scanned };
+                    break;
+                }
+                if (picked) {
+                    break;
+                }
+            }
+            if (!picked) {
+                continue;
+            }
+            const { found, absolute } = picked;
+            const origin = parseNumbers(object.origin, 3) ?? [0, 0, 0];
+            const size = parseNumbers(object.size, 3) ?? [found.width, found.height, 0];
+            const scale = parseNumbers(object.scale, 3, 1) ?? [1, 1, 1];
+            const alpha = typeof object.alpha === 'number' && Number.isFinite(object.alpha) ? object.alpha : 1;
+            layers.push({
+                index,
+                name: typeof object.name === 'string' ? object.name : '',
+                texture: picked.texEntry.name,
+                offset: absolute,
+                length: found.bytes,
+                mime: found.mime,
+                cx: origin[0],
+                cy: origin[1],
+                w: Math.abs(size[0] * scale[0]),
+                h: Math.abs(size[1] * scale[1]),
+                alpha: Math.max(0, Math.min(1, alpha)),
+            });
+        }
+        if (layers.length === 0) {
+            return null;
+        }
+        const largest = [...layers].sort((left, right) => right.w * right.h - left.w * left.h)[0];
+        const first = layers[0];
+        const frameLayer = first && first.w * first.h >= largest.w * largest.h * 0.5 ? first : largest;
+        return {
+            frame: { cx: frameLayer.cx, cy: frameLayer.cy, w: frameLayer.w, h: frameLayer.h },
+            layers: layers.map(({ index, name, offset, length, mime, cx, cy, w, h, alpha }) => ({
+                index, name, offset, length, mime, cx, cy, w, h, alpha,
+            })),
+        };
+    } catch {
+        return null;
+    } finally {
+        await closePackage(pkg);
+    }
+};
+
+/** 从文件取单张原图；只需要那一张贴图的区间，不整包读 */
+const buildSingleArtFile = async (pkgPath, {
+    minPixels = 800 * 450,
+    requireAspect = [1.15, 2.6],
+    minBytesPerPixel = 0.02,
+} = {}) => {
+    const pkg = await openPackage(pkgPath);
+    if (!pkg) {
+        return null;
+    }
+    const { handle, table } = pkg;
+    try {
+        const scene = await entryJson(handle, table, 'scene.json');
+        const objects = Array.isArray(scene?.objects) ? scene.objects : [];
+        for (const object of objects) {
+            if (!object || object.visible === false || typeof object.image !== 'string' || !object.image.endsWith('.json')) {
+                continue;
+            }
+            const model = await entryJson(handle, table, object.image);
+            const material = typeof model?.material === 'string' ? await entryJson(handle, table, model.material) : null;
+            const passes = Array.isArray(material?.passes) ? material.passes : [];
+            for (const pass of passes) {
+                const textures = Array.isArray(pass?.textures) ? pass.textures : [];
+                for (const texture of textures) {
+                    if (typeof texture !== 'string' || texture.length === 0) {
+                        continue;
+                    }
+                    const texEntry = textureEntryFor(table, texture);
+                    if (!texEntry) {
+                        continue;
+                    }
+                    const scanned = await scanTexture(handle, table, texEntry, { minPixels, requireAspect, minBytesPerPixel });
+                    if (scanned && scanned.found.bytes / (scanned.found.width * scanned.found.height) >= minBytesPerPixel) {
+                        const { found, buffer } = scanned;
+                        return {
+                            body: buffer.subarray(found.start, found.end),
+                            mime: found.mime,
+                            width: found.width,
+                            height: found.height,
+                            texture: texEntry.name,
+                            layer: object.name ?? object.image,
+                        };
+                    }
+                }
+            }
+        }
+
+        let best = null;
+        const texEntries = table.entries
+            .filter((entry) => entry.name.toLowerCase().endsWith('.tex'))
+            .sort((left, right) => right.length - left.length)
+            .slice(0, 80);
+        for (const entry of texEntries) {
+            const scanned = await scanTexture(handle, table, entry, { minPixels, requireAspect, minBytesPerPixel });
+            if (!scanned) {
+                continue;
+            }
+            const { found } = scanned;
+            if (found.bytes / (found.width * found.height) < minBytesPerPixel) {
+                continue;
+            }
+            if (!best || found.width * found.height > best.found.width * best.found.height) {
+                best = { ...scanned, entry };
+            }
+        }
+        if (!best) {
+            return null;
+        }
+        const { found, buffer, entry } = best;
+        return {
+            body: buffer.subarray(found.start, found.end),
+            mime: found.mime,
+            width: found.width,
+            height: found.height,
+            texture: entry.name,
+            layer: null,
+        };
+    } catch {
+        return null;
+    } finally {
+        await closePackage(pkg);
     }
 };
 
@@ -383,6 +654,7 @@ module.exports = {
     findEmbeddedImage,
     buildScene,
     buildSingleArt,
-    readPackage,
+    buildSceneFile,
+    buildSingleArtFile,
     isPlainShader,
 };

@@ -52,26 +52,26 @@ const MIME = {
     '.flac': 'audio/flac',
 };
 
-const isFile = (value) => {
+const isFile = async (value) => {
     try {
-        return fs.statSync(value).isFile();
+        return (await fs.promises.stat(value)).isFile();
     } catch {
         return false;
     }
 };
 
-const isDir = (value) => {
+const isDir = async (value) => {
     try {
-        return fs.statSync(value).isDirectory();
+        return (await fs.promises.stat(value)).isDirectory();
     } catch {
         return false;
     }
 };
 
 // project.json 常带 BOM，且可能是 UTF-16 或带非法字节；读不动就算没有。
-const readJson = (file) => {
+const readJson = async (file) => {
     try {
-        let text = fs.readFileSync(file, 'utf8');
+        let text = await fs.promises.readFile(file, 'utf8');
         if (text.charCodeAt(0) === 0xfeff) {
             text = text.slice(1);
         }
@@ -82,11 +82,11 @@ const readJson = (file) => {
 };
 
 // 只从 libraryfolders.vdf 里抠 "path" 行，不实现整套 VDF 解析。
-const vdfLibraryPaths = (file) => {
+const vdfLibraryPaths = async (file) => {
     const found = [];
     let text;
     try {
-        text = fs.readFileSync(file, 'utf8');
+        text = await fs.promises.readFile(file, 'utf8');
     } catch {
         return found;
     }
@@ -98,73 +98,85 @@ const vdfLibraryPaths = (file) => {
     return found;
 };
 
+/* 并发上限：壁纸多的时候别一次开几百个文件句柄 */
+const mapLimit = async (items, limit, worker) => {
+    const results = new Array(items.length);
+    let index = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (index < items.length) {
+            const current = index;
+            index += 1;
+            results[current] = await worker(items[current], current);
+        }
+    });
+    await Promise.all(runners);
+    return results;
+};
+
 /*
  * Steam 库根目录（含 steamapps 的目录）：
  * 常见安装位置 + 各盘符的 SteamLibrary + libraryfolders.vdf 里登记的路径，
  * 全部去重。只做 exists 检查，不递归、不遍历整个磁盘。
  */
-const findSteamRoots = () => {
+const findSteamRoots = async () => {
     const candidates = [];
     const programFiles = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, 'C:\\Program Files (x86)', 'C:\\Program Files'];
     programFiles.filter(Boolean).forEach((base) => {
         candidates.push(path.join(base, 'Steam'));
         candidates.push(path.join(base, 'Steam', 'steamapps'));
     });
+    const drives = [];
     for (let code = 67; code <= 90; code += 1) {
-        const drive = `${String.fromCharCode(code)}:\\`;
-        if (!isDir(drive)) {
-            continue;
-        }
+        drives.push(`${String.fromCharCode(code)}:\\`);
+    }
+    const present = await Promise.all(drives.map(async (drive) => ((await isDir(drive)) ? drive : null)));
+    present.filter(Boolean).forEach((drive) => {
         candidates.push(path.join(drive, 'Steam'));
         candidates.push(path.join(drive, 'SteamLibrary'));
         candidates.push(path.join(drive, 'Program Files (x86)', 'Steam'));
         candidates.push(path.join(drive, 'Program Files', 'Steam'));
         candidates.push(path.join(drive, 'Games', 'Steam'));
         candidates.push(path.join(drive, 'SteamLibrary2'));
-    }
+    });
 
     const roots = new Set();
-    const addRoot = (value) => {
+    const addRoot = async (value) => {
         if (!value) {
             return;
         }
         const normalized = path.resolve(value);
         // 传进来的可能是 steamapps 本身
         const root = path.basename(normalized).toLowerCase() === 'steamapps' ? path.dirname(normalized) : normalized;
-        if (isDir(path.join(root, 'steamapps'))) {
+        if (await isDir(path.join(root, 'steamapps'))) {
             roots.add(root);
         }
     };
 
-    candidates.forEach(addRoot);
+    await Promise.all(candidates.map(addRoot));
     // 第一轮拿到的根里可能登记了别的库
-    Array.from(roots).forEach((root) => {
-        vdfLibraryPaths(path.join(root, 'steamapps', 'libraryfolders.vdf')).forEach(addRoot);
-        vdfLibraryPaths(path.join(root, 'config', 'libraryfolders.vdf')).forEach(addRoot);
-    });
+    const discovered = [];
+    for (const root of Array.from(roots)) {
+        discovered.push(...await vdfLibraryPaths(path.join(root, 'steamapps', 'libraryfolders.vdf')));
+        discovered.push(...await vdfLibraryPaths(path.join(root, 'config', 'libraryfolders.vdf')));
+    }
+    await Promise.all(discovered.map(addRoot));
     return Array.from(roots);
 };
 
-const findWorkshopDirs = (roots) => {
-    const dirs = [];
-    roots.forEach((root) => {
+const findWorkshopDirs = async (roots) => {
+    const found = await Promise.all(roots.map(async (root) => {
         const dir = path.join(root, 'steamapps', 'workshop', 'content', WE_APP_ID);
-        if (isDir(dir)) {
-            dirs.push(dir);
-        }
-    });
-    return dirs;
+        return (await isDir(dir)) ? dir : null;
+    }));
+    return found.filter(Boolean);
 };
 
-const findEngineDirs = (roots) => {
-    const dirs = [];
-    roots.forEach((root) => {
+const findEngineDirs = async (roots) => {
+    const found = await Promise.all(roots.map(async (root) => {
         const dir = path.join(root, 'steamapps', 'common', 'wallpaper_engine');
-        if (isDir(dir)) {
-            dirs.push(dir);
-        }
-    });
-    return dirs;
+        return (await isDir(dir)) ? dir : null;
+    }));
+    return found.filter(Boolean);
 };
 
 /*
@@ -172,8 +184,8 @@ const findEngineDirs = (roots) => {
  * 存在 <steamid>.general.wallpaperconfig.selectedwallpapers.<Monitor>.file。
  * 拿不到就返回 null —— 这只是「跟随桌面壁纸」模式的便利，不是必需。
  */
-const readCurrentDesktopWallpaper = (engineDir) => {
-    const config = readJson(path.join(engineDir, 'config.json'));
+const readCurrentDesktopWallpaper = async (engineDir) => {
+    const config = await readJson(path.join(engineDir, 'config.json'));
     if (!config || typeof config !== 'object') {
         return null;
     }
@@ -203,8 +215,8 @@ const readCurrentDesktopWallpaper = (engineDir) => {
  * scene 壁纸的内容封在 scene.pkg 里，必须 Wallpaper Engine 自己的运行时
  * 才解得开，第三方无法还原 —— 那就老实显示预览图，并在面板里标注。
  */
-const readWallpaper = (dir, source, idPrefix) => {
-    const project = readJson(path.join(dir, 'project.json'));
+const readWallpaper = async (dir, source, idPrefix) => {
+    const project = await readJson(path.join(dir, 'project.json'));
     if (!project || typeof project !== 'object') {
         return null;
     }
@@ -221,8 +233,10 @@ const readWallpaper = (dir, source, idPrefix) => {
     };
     const fileAbs = resolve(fileRel);
     const previewAbs = resolve(previewRel);
-    const hasFile = fileAbs ? isFile(fileAbs) : false;
-    const hasPreview = previewAbs ? isFile(previewAbs) : false;
+    const [hasFile, hasPreview] = await Promise.all([
+        fileAbs ? isFile(fileAbs) : false,
+        previewAbs ? isFile(previewAbs) : false,
+    ]);
 
     let live = null;
     if (hasFile) {
@@ -254,26 +268,25 @@ const readWallpaper = (dir, source, idPrefix) => {
     };
 };
 
-const scanLibrary = () => {
-    const roots = findSteamRoots();
-    const workshopDirs = findWorkshopDirs(roots);
-    const engineDirs = findEngineDirs(roots);
+const scanLibrary = async () => {
+    const roots = await findSteamRoots();
+    const workshopDirs = await findWorkshopDirs(roots);
+    const engineDirs = await findEngineDirs(roots);
     const items = [];
     const seen = new Set();
 
-    const addFrom = (dir, source, idPrefix) => {
+    const addFrom = async (dir, source, idPrefix) => {
         let names;
         try {
-            names = fs.readdirSync(dir, { withFileTypes: true });
+            names = await fs.promises.readdir(dir, { withFileTypes: true });
         } catch {
             return;
         }
-        names.forEach((entry) => {
-            if (!entry.isDirectory() || entry.name.startsWith('.')) {
-                return;
-            }
-            const full = path.join(dir, entry.name);
-            const item = readWallpaper(full, source, '');
+        const dirs = names
+            .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+            .map((entry) => path.join(dir, entry.name));
+        const found = await mapLimit(dirs, 8, async (full) => ({ full, item: await readWallpaper(full, source, '') }));
+        found.forEach(({ full, item }) => {
             if (!item) {
                 return;
             }
@@ -283,21 +296,23 @@ const scanLibrary = () => {
                 return;
             }
             seen.add(key);
-            item.id = idPrefix + entry.name;
+            item.id = idPrefix + path.basename(full);
             item.dir = full;
             items.push(item);
         });
     };
 
-    workshopDirs.forEach((dir) => addFrom(dir, 'workshop', 'w-'));
-    engineDirs.forEach((engineDir) => {
-        addFrom(path.join(engineDir, 'projects', 'myprojects'), 'local', 'l-');
-    });
+    for (const dir of workshopDirs) {
+        await addFrom(dir, 'workshop', 'w-');
+    }
+    for (const engineDir of engineDirs) {
+        await addFrom(path.join(engineDir, 'projects', 'myprojects'), 'local', 'l-');
+    }
 
     items.sort((left, right) => left.title.localeCompare(right.title, 'zh-Hans-CN'));
 
     const engineDir = engineDirs[0] ?? null;
-    const desktop = engineDir ? readCurrentDesktopWallpaper(engineDir) : null;
+    const desktop = engineDir ? await readCurrentDesktopWallpaper(engineDir) : null;
     let currentId = null;
     if (desktop?.workshopId) {
         const match = items.find((item) => item.workshopId === desktop.workshopId);
@@ -337,25 +352,20 @@ const ART_CACHE_BYTES = 14 * 1024 * 1024;
 const manifestCache = new Map();
 const MANIFEST_CACHE_ENTRIES = 8;
 
-const pkgKeyOf = (item) => {
+const pkgKeyOf = async (item) => {
     const pkgPath = path.join(item.dir, 'scene.pkg');
-    const stat = fs.statSync(pkgPath);
+    const stat = await fs.promises.stat(pkgPath);
     return { pkgPath, stat, key: `${item.id}:${stat.size}:${Math.round(stat.mtimeMs)}` };
 };
 
-const readPkgBuffer = (pkgPath) => {
-    const loaded = scenePkg.readPackage(pkgPath, 256 * 1024 * 1024);
-    return loaded ? loaded.buffer : null;
-};
-
 /** 单张原图（背景那一层），用于「单张原画」模式和抽不到图层时的兜底 */
-const sceneArtFor = (item) => {
+const sceneArtFor = async (item) => {
     if (!item || item.kind !== 'scene' || !item.dir) {
         return null;
     }
     let info;
     try {
-        info = pkgKeyOf(item);
+        info = await pkgKeyOf(item);
     } catch {
         return null;
     }
@@ -365,16 +375,13 @@ const sceneArtFor = (item) => {
         artCache.set(info.key, cached);
         return cached;
     }
-    const buffer = readPkgBuffer(info.pkgPath);
-    if (!buffer) {
-        return null;
-    }
     let art = null;
     try {
-        const found = scenePkg.buildSingleArt(buffer);
+        const found = await scenePkg.buildSingleArtFile(info.pkgPath);
         if (found) {
             art = {
-                body: buffer.subarray(found.start, found.end),
+                // 复制一份，别让缓存的原图拖着一整张贴图缓冲区
+                body: Buffer.from(found.body),
                 mime: found.mime,
                 width: found.width,
                 height: found.height,
@@ -398,13 +405,13 @@ const sceneArtFor = (item) => {
  * 图层清单：{ frame:{cx,cy,w,h}, layers:[{index,name,cx,cy,w,h,alpha,offset,length,mime}] }
  * 图片字节按需从包里读，清单本身只有几 KB。
  */
-const sceneLayersFor = (item) => {
+const sceneLayersFor = async (item) => {
     if (!item || item.kind !== 'scene' || !item.dir) {
         return null;
     }
     let info;
     try {
-        info = pkgKeyOf(item);
+        info = await pkgKeyOf(item);
     } catch {
         return null;
     }
@@ -414,13 +421,9 @@ const sceneLayersFor = (item) => {
         manifestCache.set(info.key, cached);
         return cached;
     }
-    const buffer = readPkgBuffer(info.pkgPath);
-    if (!buffer) {
-        return null;
-    }
     let manifest = null;
     try {
-        const built = scenePkg.buildScene(buffer);
+        const built = await scenePkg.buildSceneFile(info.pkgPath);
         if (built) {
             manifest = { ...built, pkgPath: info.pkgPath, key: info.key };
         }
@@ -584,10 +587,10 @@ const corsHeaders = (request) => (
         : {}
 );
 
-const serveFile = (request, response, filePath, { allowRange = true } = {}, tokenPrefix = '', documentHeaders = null) => {
+const serveFile = async (request, response, filePath, { allowRange = true } = {}, tokenPrefix = '', documentHeaders = null) => {
     let stat;
     try {
-        stat = fs.statSync(filePath);
+        stat = await fs.promises.stat(filePath);
     } catch {
         response.writeHead(404, { 'Cache-Control': 'no-store' });
         response.end('Not found');
@@ -611,7 +614,7 @@ const serveFile = (request, response, filePath, { allowRange = true } = {}, toke
     if (path.extname(filePath).toLowerCase() === '.html' || path.extname(filePath).toLowerCase() === '.htm') {
         let html = '';
         try {
-            html = fs.readFileSync(filePath, 'utf8');
+            html = await fs.promises.readFile(filePath, 'utf8');
         } catch {
             response.writeHead(500, { 'Cache-Control': 'no-store' });
             response.end('Read failed');
@@ -693,7 +696,7 @@ const startWebServer = (item) => new Promise((resolve, reject) => {
     const token = crypto.randomBytes(16).toString('hex');
     const tokenPrefix = `/${token}`;
     const root = item.dir;
-    const server = http.createServer((request, response) => {
+    const server = http.createServer(async (request, response) => {
         try {
             const url = new URL(request.url, 'http://127.0.0.1');
             if (url.pathname !== tokenPrefix && !url.pathname.startsWith(`${tokenPrefix}/`)) {
@@ -731,7 +734,7 @@ const startWebServer = (item) => new Promise((resolve, reject) => {
                 response.end('Forbidden');
                 return;
             }
-            serveFile(request, response, target, {}, tokenPrefix, { 'Content-Security-Policy': WEB_CSP });
+            await serveFile(request, response, target, {}, tokenPrefix, { 'Content-Security-Policy': WEB_CSP });
         } catch (error) {
             try {
                 response.writeHead(500, { 'Cache-Control': 'no-store' });
@@ -764,7 +767,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
      */
     const token = crypto.randomBytes(16).toString('hex');
     const tokenPrefix = `/${token}`;
-    const server = http.createServer((request, response) => {
+    const server = http.createServer(async (request, response) => {
         try {
             const url = new URL(request.url, 'http://127.0.0.1');
             // 前缀不对一律 404，不泄露任何信息
@@ -808,7 +811,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 const itemId = decodeURIComponent(segments[1]);
                 const library = getLibrary();
                 const item = library?.items?.find((entry) => entry.id === itemId);
-                const manifest = item ? sceneLayersFor(item) : null;
+                const manifest = item ? await sceneLayersFor(item) : null;
                 const body = JSON.stringify({
                     ok: Boolean(manifest),
                     frame: manifest?.frame ?? null,
@@ -837,7 +840,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 const layerIndex = Number(segments[3]);
                 const library = getLibrary();
                 const item = library?.items?.find((entry) => entry.id === itemId);
-                const manifest = item ? sceneLayersFor(item) : null;
+                const manifest = item ? await sceneLayersFor(item) : null;
                 const layer = Number.isInteger(layerIndex) ? manifest?.layers?.[layerIndex] : null;
                 if (!layer) {
                     response.writeHead(404, { 'Cache-Control': 'no-store' });
@@ -878,7 +881,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 const itemId = decodeURIComponent(segments[1]);
                 const library = getLibrary();
                 const item = library?.items?.find((entry) => entry.id === itemId);
-                const art = item ? sceneArtFor(item) : null;
+                const art = item ? await sceneArtFor(item) : null;
                 if (!art) {
                     response.writeHead(404, { 'Cache-Control': 'no-store' });
                     response.end('No art');
@@ -939,7 +942,7 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 response.end('Forbidden');
                 return;
             }
-            serveFile(request, response, target, {}, tokenPrefix);
+            await serveFile(request, response, target, {}, tokenPrefix);
         } catch (error) {
             try {
                 response.writeHead(500, { 'Cache-Control': 'no-store' });
@@ -987,36 +990,51 @@ module.exports = function activate(api) {
         [...webHosts.keys()].forEach(closeWebHost);
     };
 
-    const ensureLibrary = (force) => {
+    let scanInFlight = null;
+
+    /*
+     * 扫描全程走异步 IO，并且同一时间只扫一次：面板打开、壁纸挂载、网页壁纸
+     * 请求临时地址都可能同时来，没必要各扫一遍。
+     */
+    const ensureLibrary = async (force) => {
         const fresh = !force && library && Date.now() - lastScannedAt < 60_000;
         if (fresh) {
             return library;
         }
-        try {
-            library = scanLibrary();
-            lastScannedAt = Date.now();
-            api.log.info(`扫描到 ${library.items.length} 个壁纸`, {
-                engineDir: library.engineDir,
-                workshopDirs: library.workshopDirs,
-            });
-        } catch (error) {
-            api.log.error('扫描壁纸库失败', error);
-            library = {
-                items: [],
-                currentId: null,
-                engineDir: null,
-                workshopDirs: [],
-                roots: [],
-                desktopFile: null,
-                error: String(error && error.message ? error.message : error),
-            };
-            lastScannedAt = Date.now();
+        if (scanInFlight) {
+            return scanInFlight;
         }
-        return library;
+        scanInFlight = (async () => {
+            try {
+                const scanned = await scanLibrary();
+                library = scanned;
+                lastScannedAt = Date.now();
+                api.log.info(`扫描到 ${library.items.length} 个壁纸`, {
+                    engineDir: library.engineDir,
+                    workshopDirs: library.workshopDirs,
+                });
+            } catch (error) {
+                api.log.error('扫描壁纸库失败', error);
+                library = {
+                    items: [],
+                    currentId: null,
+                    engineDir: null,
+                    workshopDirs: [],
+                    roots: [],
+                    desktopFile: null,
+                    error: String(error && error.message ? error.message : error),
+                };
+                lastScannedAt = Date.now();
+            } finally {
+                scanInFlight = null;
+            }
+            return library;
+        })();
+        return scanInFlight;
     };
 
-    const payload = (force) => {
-        const current = ensureLibrary(force);
+    const payload = async (force) => {
+        const current = await ensureLibrary(force);
         return {
             ok: current.items.length > 0,
             base,
@@ -1053,7 +1071,7 @@ module.exports = function activate(api) {
         if (!id) {
             return { ok: false, error: 'bad-id' };
         }
-        const current = ensureLibrary(false);
+        const current = await ensureLibrary(false);
         const item = current.items.find((entry) => entry.id === id);
         if (!item || item.kind !== 'web' || item.live !== 'web' || !item.dir || !item.file) {
             return { ok: false, error: 'not-a-web-wallpaper' };
@@ -1142,8 +1160,8 @@ module.exports = function activate(api) {
         server = started.server;
         base = started.base;
         api.log.info(`壁纸服务已启动 ${base}`);
-        // 先建好库，面板打开时不必等
-        ensureLibrary(false);
+        // 后台先建好库，面板打开时不必等（扫描是异步的，不挡 ready）
+        ensureLibrary(false).catch(() => {});
         api.rpc.send('ready', { base });
     }).catch((error) => {
         api.log.error('壁纸服务启动失败', error);
