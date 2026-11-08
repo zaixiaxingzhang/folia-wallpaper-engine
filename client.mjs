@@ -2,7 +2,7 @@
 //
 // 它做三件事：
 //   1. 把 Wallpaper Engine 的壁纸画在播放页背景层上（视频壁纸真的在放，
-//      网页壁纸用 iframe 跑，场景壁纸用官方预览图）；
+//      网页壁纸用 iframe 跑，场景壁纸的引擎与脚本在隔离 iframe 里跑）；
 //   2. 给歌词做可读性避让：实时测背景在歌词那一条带上的亮度，按主题歌词色
 //      反解出需要的叠色透明度，保证对比度达到设定值；
 //   3. 在背景类型自带的「更多设置」里给出一套面板：选哪一张、伪随机、以及
@@ -38,48 +38,82 @@ export default function activate(folium) {
     let libraryPromise = null;
 
     /*
-     * WebWallGL：MIT 许可的 Wallpaper Engine 场景渲染器（vendor/webwallgl.global.min.js，
-     * 随模组一起分发）。场景的着色器、粒子、视差、SceneScript 都由它跑，
-     * 场景壁纸因此能像在 Wallpaper Engine 里一样动起来。
-     *
-     * 用 UMD 构建而不是 .mjs：ESM 版对 mediabunny 有裸导入，需要打包器解析；
-     * UMD 版自带全部依赖，挂到 window.WebWallGL 上，用 script 标签加载即可。
-     * 脚本地址由本模块的 URL 推出来，不硬编码协议与主机。
+     * WebWallGL：MIT 许可的场景渲染器（vendor/webwallgl.global.min.js）。
+     * 它和 SceneScript 一起由主进程的场景宿主页加载，跑在独立 origin 的 iframe 里；
+     * 本文件（Folia 页面）不加载引擎、也不执行壁纸脚本。
      */
-    let enginePromise = null;
-    const loadEngine = () => {
-        if (typeof window !== 'undefined' && window.WebWallGL) {
-            return Promise.resolve(window.WebWallGL);
+    /*
+     * 场景/网页壁纸的 iframe 读不到 Folia 的 file://、folia-mod:// 封面，CSP 也不让
+     * 它去访问别的 origin。这里在父页面把封面转成 data: URL 再送过去，带缓存。
+     */
+    const coverCache = new Map();
+    const cacheCover = (url, data) => {
+        if (!url || !data) {
+            return;
         }
-        if (enginePromise) {
-            return enginePromise;
+        coverCache.set(url, data);
+        while (coverCache.size > 8) {
+            coverCache.delete(coverCache.keys().next().value);
         }
-        enginePromise = new Promise((resolve, reject) => {
-            if (typeof document === 'undefined' || !document.head) {
-                reject(new Error('no document'));
-                return;
-            }
-            const script = document.createElement('script');
-            try {
-                script.src = new URL('./vendor/webwallgl.global.min.js', import.meta.url).href;
-            } catch (error) {
-                reject(error);
-                return;
-            }
-            script.addEventListener('load', () => {
-                if (window.WebWallGL) {
-                    resolve(window.WebWallGL);
-                } else {
-                    reject(new Error('WebWallGL 未挂载到 window'));
+    };
+    const coverToDataUrl = (url) => {
+        if (!url || typeof url !== 'string') {
+            return Promise.resolve('');
+        }
+        if (url.startsWith('data:')) {
+            return Promise.resolve(url);
+        }
+        if (coverCache.has(url)) {
+            return Promise.resolve(coverCache.get(url) || '');
+        }
+        return (async () => {
+            if (typeof fetch === 'function' && typeof FileReader === 'function') {
+                try {
+                    const response = await fetch(url, { cache: 'no-store' });
+                    const blob = response.ok ? await response.blob() : null;
+                    if (blob && blob.type.startsWith('image/') && blob.size <= 6 * 1024 * 1024) {
+                        const data = await new Promise((resolve) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(String(reader.result || ''));
+                            reader.onerror = () => resolve('');
+                            reader.readAsDataURL(blob);
+                        });
+                        if (data.startsWith('data:image/')) {
+                            cacheCover(url, data);
+                            return data;
+                        }
+                    }
+                } catch {
+                    /* file:// 或没有 CORS，落到下面的图片 + canvas */
                 }
-            }, { once: true });
-            script.addEventListener('error', () => reject(new Error('引擎脚本加载失败')), { once: true });
-            document.head.append(script);
-        }).catch((error) => {
-            enginePromise = null;
-            throw error;
-        });
-        return enginePromise;
+            }
+            try {
+                const image = await new Promise((resolve) => {
+                    const node = document.createElement('img');
+                    node.decoding = 'async';
+                    node.onload = () => resolve(node);
+                    node.onerror = () => resolve(null);
+                    node.src = url;
+                });
+                if (image && image.naturalWidth > 0) {
+                    const scale = Math.min(1, 256 / Math.max(image.naturalWidth, image.naturalHeight));
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+                    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+                    const data = canvas.toDataURL('image/jpeg', 0.86);
+                    if (data.startsWith('data:image/')) {
+                        cacheCover(url, data);
+                        return data;
+                    }
+                }
+            } catch {
+                /* 跨源图片会把画布污染，拿不到像素就放弃 */
+            }
+            cacheCover(url, '');
+            return '';
+        })();
     };
 
     const loadLibrary = (refresh) => {
@@ -659,9 +693,15 @@ export default function activate(folium) {
         style.textContent = `
             .wp-eng-root { position: absolute; inset: 0; overflow: hidden; contain: strict; background: #06070a; }
             .wp-eng-media { position: absolute; inset: 0; transform-origin: 50% 50%; will-change: transform; }
-            .wp-eng-media > video, .wp-eng-media > img, .wp-eng-media > canvas { width: 100%; height: 100%; display: block; object-fit: cover; border: 0; }
-            .wp-eng-media > iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity 700ms ease; }
-            .wp-eng-media > iframe.wp-eng-ready { opacity: 1; }
+            .wp-eng-media > video, .wp-eng-media > img, .wp-eng-media > canvas,
+            .wp-eng-layer > video, .wp-eng-layer > img, .wp-eng-layer > canvas { width: 100%; height: 100%; display: block; object-fit: cover; border: 0; }
+            .wp-eng-media > iframe, .wp-eng-layer > iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; opacity: 0; transition: opacity 700ms ease; }
+            .wp-eng-media > iframe.wp-eng-ready, .wp-eng-layer > iframe.wp-eng-ready { opacity: 1; }
+            .wp-eng-layer { position: absolute; inset: 0; opacity: 1; transition: opacity 240ms ease; }
+            .wp-eng-layer.wp-eng-layer-new { opacity: 0; }
+            .wp-eng-layer.wp-eng-layer-in { opacity: 1; }
+            .wp-eng-layer.wp-eng-layer-out { opacity: 0; }
+            .wp-eng-poster { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 2; pointer-events: none; }
             .wp-eng-scrim, .wp-eng-dim, .wp-eng-vignette, .wp-eng-info { position: absolute; inset: 0; pointer-events: none; }
             .wp-eng-dim, .wp-eng-vignette { background: #000; }
             .wp-eng-info {
@@ -725,7 +765,8 @@ export default function activate(folium) {
 
         let media = null;          // video | img | iframe | canvas | live host
         let currentKey = null;
-        let liveInstance = null;   // WebWallGL 实例（场景实时渲染时才有）
+        let sceneBridge = null;    // 当前场景 iframe 的 postMessage 通道
+        let sceneLuminance = null; // 场景 iframe 上报的亮度（跨源读不到像素）
         let customMedia = false;   // 当前媒体来自 folia-mod://（画布不可采样）
         let sceneErrorCard = null; // 场景三层都失败时的错误卡
         let sceneToast = null;     // 实时渲染失败、但兜底成功时的顶部提示
@@ -775,13 +816,12 @@ export default function activate(folium) {
 
         const refreshReadability = () => {
             // 实时场景：直接采引擎画布。跨源贴图可能污染画布读不出像素，读不到就按中等偏亮估
-            if (liveInstance?.canvas) {
-                const luminance = sampleBandLuminance(liveInstance.canvas);
-                paintReadability(luminance ?? 0.34);
+            if (media && media.tagName === 'IFRAME' && sceneLuminance != null) {
+                paintReadability(sceneLuminance);
                 return;
             }
             if (!media || media.tagName === 'IFRAME') {
-                // 网页壁纸读不到像素：按「中等偏亮」保守估一份，不会把画面压死
+                // 网页壁纸/场景 iframe 读不到像素：按「中等偏亮」保守估一份
                 paintReadability(0.34);
                 return;
             }
@@ -949,7 +989,7 @@ export default function activate(folium) {
             }
 
             const fit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
-            if (media && media.tagName !== 'IFRAME' && !liveInstance) {
+            if (media && media.tagName !== 'IFRAME') {
                 media.style.objectFit = fit;
             }
 
@@ -958,16 +998,8 @@ export default function activate(folium) {
 
             info.classList.toggle('wp-eng-visible', settings.showInfo !== false);
 
-            if (liveInstance && settings.syncPause) {
-                try {
-                    if (context.isPaused()) {
-                        liveInstance.pause();
-                    } else {
-                        liveInstance.resume();
-                    }
-                } catch {
-                    /* 实例还没就绪 */
-                }
+            if (sceneBridge && settings.syncPause) {
+                sceneBridge.send({ type: context.isPaused() ? 'pause' : 'resume' });
             }
 
             if (media && media.tagName === 'VIDEO' && settings.syncPause) {
@@ -986,29 +1018,210 @@ export default function activate(folium) {
 
         const teardownMedia = () => {
             stopMotion();
-            if (cleanupMedia) {
+            const layers = Array.from(mediaWrap.children ?? []);
+            let hadLayer = false;
+            layers.forEach((layer) => {
+                if (!isLayer(layer)) {
+                    return;
+                }
+                hadLayer = true;
+                const state = layerStates.get(layer);
+                disposeLayer(layer, state);
+                layerStates.delete(layer);
+            });
+            // 预览图直接挂在 mediaWrap 上，没有 layer 状态
+            if (cleanupMedia && !hadLayer) {
                 try {
                     cleanupMedia();
                 } catch {
                     /* 清理失败不影响换下一张 */
                 }
-                cleanupMedia = null;
             }
-            if (media) {
-                if (media.tagName === 'VIDEO') {
-                    try {
-                        media.pause();
-                        media.removeAttribute('src');
-                        media.load();
-                    } catch {
-                        /* 已经销毁 */
-                    }
-                }
+            if (media && !hadLayer) {
+                pauseMedia(media);
                 media.remove();
-                media = null;
             }
+            cleanupMedia = null;
+            media = null;
             customMedia = false;
+            activeLayer = null;
             mediaWrap.replaceChildren();
+        };
+
+        // ---- 双缓冲：旧壁纸留着，新壁纸就绪后交叉淡入，避免切换时先黑一块 ----
+        let activeLayer = null;
+        const layerStates = new WeakMap();
+
+        const isLayer = (node) => node && (node.classList?.contains?.('wp-eng-layer') || String(node.className ?? '').split(/\s+/).includes('wp-eng-layer'));
+
+        const pauseMedia = (node) => {
+            if (!node || node.tagName !== 'VIDEO') {
+                return;
+            }
+            try {
+                node.pause();
+                node.removeAttribute('src');
+                node.load();
+            } catch {
+                /* 已经销毁 */
+            }
+        };
+
+        const disposeLayer = (layer, state) => {
+            try {
+                state?.cleanup?.();
+            } catch {
+                /* 清理失败不影响下一张 */
+            }
+            pauseMedia(state?.media);
+            try {
+                layer.remove();
+            } catch {
+                /* 已经移走 */
+            }
+        };
+
+        const collectNodes = (layer) => {
+            const found = [];
+            const walk = (node) => {
+                Array.from(node.children ?? []).forEach((child) => {
+                    found.push(child);
+                    walk(child);
+                });
+            };
+            walk(layer);
+            return found;
+        };
+
+        /*
+         * 等新层里有东西可看再淡入：图片/视频首帧/iframe 加载，或海报加载。
+         * 都没有（纯引擎场景）就等一小会儿，让引擎先起画；最迟 1.2 秒收尾。
+         */
+        const revealLayer = (layer) => new Promise((resolve) => {
+            let done = false;
+            let poll = 0;
+            let hardTimer = 0;
+            const attached = new WeakSet();
+            const finish = () => {
+                if (done) {
+                    return;
+                }
+                done = true;
+                if (poll) {
+                    clearInterval(poll);
+                }
+                if (hardTimer) {
+                    clearTimeout(hardTimer);
+                }
+                resolve();
+            };
+            const scan = () => {
+                if (done) {
+                    return;
+                }
+                collectNodes(layer).forEach((node) => {
+                    if (node.tagName === 'IMG') {
+                        if (node.complete && node.naturalWidth > 0) {
+                            finish();
+                            return;
+                        }
+                        if (!attached.has(node)) {
+                            attached.add(node);
+                            node.addEventListener('load', finish, { once: true });
+                            node.addEventListener('error', finish, { once: true });
+                        }
+                    } else if (node.tagName === 'VIDEO') {
+                        if (node.readyState >= 2) {
+                            finish();
+                            return;
+                        }
+                        if (!attached.has(node)) {
+                            attached.add(node);
+                            node.addEventListener('loadeddata', finish, { once: true });
+                            node.addEventListener('error', finish, { once: true });
+                        }
+                    } else if (node.tagName === 'IFRAME' && !attached.has(node)) {
+                        attached.add(node);
+                        node.addEventListener('load', finish, { once: true });
+                    }
+                });
+            };
+            // 场景/网页的节点是异步挂进来的，隔一会儿再看一眼；最迟 1.2 秒收尾
+            scan();
+            if (done) {
+                return;
+            }
+            poll = setInterval(scan, 120);
+            hardTimer = setTimeout(finish, 1200);
+        });
+
+        const swapTo = (mount) => {
+            const previousLayer = activeLayer;
+            const previousState = previousLayer ? layerStates.get(previousLayer) : null;
+            // 连切两次时，最老的那层已经在新层下面了，直接收掉，别留在 DOM 里
+            Array.from(mediaWrap.children ?? []).forEach((child) => {
+                if (!isLayer(child) || child === previousLayer) {
+                    return;
+                }
+                disposeLayer(child, layerStates.get(child));
+                layerStates.delete(child);
+            });
+            if (previousState) {
+                previousState.retiring = true;
+            }
+            // 从「选择器里的静态预览」切回正式壁纸时，清掉直接挂在 mediaWrap 上的预览图
+            if (!previousLayer) {
+                Array.from(mediaWrap.children ?? []).forEach((child) => {
+                    if (isLayer(child)) {
+                        return;
+                    }
+                    pauseMedia(child);
+                    child.remove();
+                });
+                try {
+                    cleanupMedia?.();
+                } catch {
+                    /* 预览图没有清理函数 */
+                }
+            }
+            const layer = document.createElement('div');
+            layer.className = 'wp-eng-layer wp-eng-layer-new';
+            mediaWrap.append(layer);
+            activeLayer = layer;
+            media = null;
+            cleanupMedia = null;
+            customMedia = false;
+            try {
+                mount(layer);
+            } catch (error) {
+                pushDiag('切换壁纸', `挂载失败：${error?.message ?? error}`, 'error');
+            }
+            layerStates.set(layer, { cleanup: cleanupMedia, media });
+
+            revealLayer(layer).then(() => {
+                if (activeLayer !== layer) {
+                    const state = layerStates.get(layer);
+                    // 已经被下一轮接管（正在等淡出）就别抢着销毁
+                    if (state && !state.retiring) {
+                        disposeLayer(layer, state);
+                        layerStates.delete(layer);
+                    }
+                    return;
+                }
+                // 先让浏览器算一次起始样式（opacity: 0），否则同一帧加 class 会把过渡吃掉
+                if (typeof layer.getBoundingClientRect === 'function') {
+                    layer.getBoundingClientRect();
+                }
+                layer.classList.add('wp-eng-layer-in');
+                if (!previousLayer) {
+                    return;
+                }
+                previousLayer.classList.add('wp-eng-layer-out');
+                setTimeout(() => {
+                    disposeLayer(previousLayer, previousState);
+                    layerStates.delete(previousLayer);
+                }, 260);
+            });
         };
 
         /*
@@ -1099,7 +1312,7 @@ export default function activate(folium) {
          * 叠到一张 canvas 上，得到一张分辨率远超官方预览图的完整画面。
          * 逐层加载、画完即释放，避免十几张 4K 位图同时驻留显存。
          */
-        const compositeScene = async (item, isCancelled) => {
+        const compositeScene = async (item, isCancelled, target) => {
             if (!library?.base) {
                 pushDiag('合成静态图', '本地服务没有就绪（library.base 为空）');
                 return false;
@@ -1138,7 +1351,7 @@ export default function activate(folium) {
             painter.fillStyle = '#06070a';
             painter.fillRect(0, 0, width, height);
             media = canvas;
-            mediaWrap.append(canvas);
+            target.append(canvas);
             startMotion();
 
             const scale = Math.max(width / frame.w, height / frame.h);
@@ -1181,148 +1394,9 @@ export default function activate(folium) {
         };
 
         /*
-         * 实时渲染场景：把壁纸目录挂在本地 HTTP 上，交给 WebWallGL 解析 scene.pkg 并
-         * 逐帧渲染。加载期间先垫一张预览图，避免装配那几秒黑屏。
-         * 失败（引擎没起来 / 包解析不了）返回 false，交给静态兜底。
-         */
-        const liveScene = async (item, settings, isCancelled, registerStop) => {
-            if (!library?.base) {
-                pushDiag('实时渲染', '本地服务没有就绪（library.base 为空）');
-                return false;
-            }
-            let engine;
-            try {
-                engine = await loadEngine();
-            } catch (error) {
-                pushDiag('实时渲染', `引擎脚本加载失败：${error?.message ?? error}`);
-                noteAttempt('实时渲染', false, `引擎脚本加载失败：${error?.message ?? error}`);
-                return false;
-            }
-            if (isCancelled()) {
-                return true;
-            }
-
-            let poster = null;
-
-            const host = document.createElement('div');
-            host.style.cssText = 'position:absolute;inset:0;';
-            mediaWrap.append(host);
-
-            // 引擎是否已经产出过装配/首帧诊断
-            let engineAlive = false;
-            let instance;
-            try {
-                instance = engine.createScene(host, {
-                    fit: settings.fit === 'contain' ? 'contain' : settings.fit === 'fill' ? 'stretch' : 'cover',
-                    fps: Math.max(15, Math.min(60, Number(settings.sceneFps) || 30)),
-                    volume: 0,
-                    autoplay: true,
-                    // 永远不执行壁纸自带的 SceneScript：它来自创意工坊、不在签名范围里，
-                    // 而引擎用 new Function 求值，脚本能拿到宿主页面。脚本关掉后
-                    // 场景仍会跑图层动画、粒子、着色器，只是时钟/文字/属性联动停在快照值。
-                    scripts: false,
-                    onError: (error) => {
-                        // 引擎自己报的致命错误，原样记进日志（下次导出就能看到真正原因）
-                        pushDiag('实时渲染', `引擎错误：${error?.message ?? error}`, 'error');
-                        noteAttempt('实时渲染', false, `引擎错误：${error?.message ?? error}`);
-                    },
-                    onDiagnostic: (message, level) => {
-                        // 引擎吐过装配/首帧的 info，就说明它确实跑起来了。
-                        // 后面 load() 的 promise 即使被拒，也不该把已经渲染的画面扔掉。
-                        // 只有「渲染器真的起来了」才算活着。仅凭「包已收到」会让
-                        // 卡在装配阶段的场景一直留一块黑屏，不如老实降级。
-                        if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
-                            engineAlive = true;
-                        }
-                        pushDiag('实时渲染', message, level === 'error' ? 'error' : 'info');
-                    },
-                });
-            } catch (error) {
-                pushDiag('实时渲染', `createScene 失败：${error?.message ?? error}`);
-                noteAttempt('实时渲染', false, `createScene 失败：${error?.message ?? error}`);
-                host.remove();
-                poster?.remove();
-                return false;
-            }
-
-            let destroyed = false;
-            liveInstance = instance;
-            media = host;
-            startMotion();
-            const stop = () => {
-                if (destroyed) {
-                    return;
-                }
-                destroyed = true;
-                if (liveInstance === instance) {
-                    liveInstance = null;
-                }
-                try {
-                    instance.destroy();
-                } catch {
-                    /* 已经销毁 */
-                }
-            };
-            registerStop(stop);
-            // 真实频谱 + 真实「正在播放」，替换引擎的模拟数据
-            attachAudio(instance);
-            attachMedia(instance, engine, registerStop);
-
-            const source = engine.httpSource(`${library.base}/i/${encodeURIComponent(item.id)}/r`);
-            // 首帧可能很久（大包解析）。等 20 秒：超时但引擎已经在装配，就让它继续跑；
-            // 只有从头到尾没有任何装配迹象，才算失败。
-            const firstFrame = instance.load(source)
-                .then(() => 'ready', (error) => ({ reason: error?.message ?? String(error) }))
-                .catch(() => ({ reason: 'load-failed' }));
-            const timeout = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000));
-            const outcome = await Promise.race([firstFrame, timeout]);
-            if (outcome !== 'ready' && !destroyed && !isCancelled()) {
-                if (engineAlive) {
-                    // 引擎已经在渲染（装配日志、首帧都可能晚于 load 的 promise）
-                    pushDiag('实时渲染', `load 未在预期时间内完成（${typeof outcome === 'string' ? outcome : outcome.reason}），但引擎已在渲染，继续使用`, 'info');
-                } else {
-                    const reason = typeof outcome === 'string' ? outcome : outcome.reason;
-                    pushDiag('实时渲染', `scene.pkg 解析失败：${reason}`);
-                    noteAttempt('实时渲染', false, reason);
-                    stop();
-                    host.remove();
-                    poster?.remove();
-                    return false;
-                }
-            }
-            if (destroyed) {
-                noteAttempt('实时渲染', true, '已被取消但引擎曾启动');
-                return true;
-            }
-            noteAttempt('实时渲染', true, engineAlive ? '引擎已渲染' : `load=${typeof outcome === 'string' ? outcome : 'ok'}`);
-            // 壁纸自带的 BGM 一律不播
-            try {
-                instance.setVolume?.(0);
-            } catch {
-                /* 老版本引擎没有 setVolume */
-            }
-            poster?.remove();
-            info.textContent = formatCaption(item, 'live');
-            if (settings.syncPause && context.isPaused()) {
-                try {
-                    instance.pause();
-                } catch {
-                    /* 不支持暂停 */
-                }
-            }
-            refreshReadability();
-            return true;
-        };
-
-        /*
-         * 音频响应：把 Folia 的实时频谱喂给引擎。
-         * 引擎默认用内置的模拟频谱（自己在那儿跳），所以「音频响应」类壁纸
-         * 之前跟音乐毫无关系。ctx.audio 给的是 64 段 Uint8Array（0..255），
-         * 引擎要的是左右声道各 64 段、0..1 的浮点。
-         */
-        /*
-         * 把 Folia 的实时频谱读成 WE 的 128 段格式（左 64 + 右 64，0..1）。
-         * scene 走引擎的 setAudio，网页壁纸走 postMessage 推给注入的垫片。
+         * 实时渲染场景：主进程起一个临时 origin 托管引擎、宿主页和 scene.pkg，
+         * iframe 在里面解析并逐帧渲染（SceneScript 也在里面跑）。加载期间先垫一张
+         * 静态原画，避免装配那几秒黑屏；失败返回 false，交给静态兜底。
          */
         // 上一帧的输出，用于暂停时平滑衰减（直接清零会「啪」一下，保留残留又会抽搐）
         const lastLeft = new Float32Array(64);
@@ -1412,59 +1486,142 @@ export default function activate(folium) {
             gateAndRemember(left, right);
         };
 
-        const attachAudio = (instance) => {
-            if (!context.audio || typeof instance.setAudio !== 'function') {
-                return;
-            }
-            const left = new Float32Array(64);
-            const right = new Float32Array(64);
+        /*
+         * 实时渲染场景：引擎和 SceneScript 都跑在独立 origin 的 iframe 里。
+         * 父页面只通过 postMessage 送频谱、媒体、指针和暂停状态；脚本拿不到
+         * Folia 的 window，也读不到主服务或别的壁纸。
+         */
+        const liveScene = async (item, settings, isCancelled, registerStop, target = mediaWrap) => {
+            let host;
             try {
-                instance.setAudio({ snapshot: () => { fillAudioFrames(left, right); return { left, right }; } });
-            } catch {
-                /* 老版本引擎没有 setAudio */
+                host = await folium.rpc.call('sceneFrame', {
+                    id: item.id,
+                    fit: settings.fit,
+                    fps: settings.sceneFps,
+                });
+            } catch (error) {
+                pushDiag('实时渲染', `场景宿主请求失败：${error?.message ?? error}`);
+                noteAttempt('实时渲染', false, `场景宿主请求失败：${error?.message ?? error}`);
+                return false;
             }
-        };
-
-        const attachMedia = (instance, engine, registerStop) => {
-            if (typeof engine?.createMediaSource !== 'function' || typeof instance.setMedia !== 'function') {
-                return;
+            if (!host?.ok || !host.url) {
+                pushDiag('实时渲染', `场景宿主没有起来：${host?.error ?? '未知错误'}`);
+                noteAttempt('实时渲染', false, host?.error ?? 'scene-host-unavailable');
+                return false;
             }
-            const readPlayback = () => {
+            if (isCancelled()) {
                 try {
-                    return folium.playback?.getState?.() ?? null;
+                    folium.rpc.call('releaseSceneFrame', { id: item.id });
                 } catch {
-                    return null;
+                    /* 主进程已经不在了 */
+                }
+                return true;
+            }
+
+            const frame = document.createElement('iframe');
+            // 独立 origin + 沙箱：脚本能跑，但碰不到父页面；存储 API 也还能用
+            frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-pointer-lock');
+            frame.setAttribute('allow', 'fullscreen');
+            frame.referrerPolicy = 'no-referrer';
+            frame.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;';
+            frame.src = host.url;
+            target.append(frame);
+            media = frame;
+            customMedia = true;
+            startMotion();
+
+            let poster = null;
+            const posterUrl = artUrl(library, item)
+                ?? httpUrl(library, item, item.preview)
+                ?? toFileUrl(item.absPreview);
+            if (posterUrl) {
+                poster = document.createElement('img');
+                poster.className = 'wp-eng-poster';
+                poster.src = posterUrl;
+                poster.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
+                target.append(poster);
+                poster.addEventListener('error', () => {
+                    poster?.remove();
+                    poster = null;
+                }, { once: true });
+            }
+            const takePosterDown = () => {
+                if (poster) {
+                    poster.remove();
+                    poster = null;
                 }
             };
-            /*
-             * 换歌判定不能只看 song.id：宿主给的歌曲 DTO 里 id 往往不存在（用的是 ref，
-             * 而且 ref 每次都是新分配的），于是 key 永远不变、一直显示上一首。
-             * 这里把能区分的字段都拼上，任何一项变了就重建媒体源。
-             */
-            const signatureOf = (state) => {
-                const song = state?.song ?? null;
-                if (!song) {
-                    return `none|${state?.state ?? ''}`;
-                }
-                let cover = '';
-                try {
-                    cover = context.getCoverUrl?.() ?? '';
-                } catch {
-                    cover = '';
-                }
-                return [
-                    state?.state ?? '',
-                    song.ref ?? song.id ?? '',
-                    song.title ?? '',
-                    song.artist ?? '',
-                    song.album ?? '',
-                    cover,
-                ].join('|');
-            };
 
-            let built = null;
-            const build = () => {
-                const state = readPlayback();
+            let destroyed = false;
+            let ready = false;
+            let heard = false;
+            let settled = false;
+            let resolveReady = null;
+            const readyPromise = new Promise((resolve) => {
+                resolveReady = resolve;
+            });
+            const settle = (value) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                resolveReady(value);
+            };
+            const post = (message, transfer) => {
+                try {
+                    frame.contentWindow?.postMessage({ __foliaSceneIn: 1, ...message }, host.origin, transfer || []);
+                } catch {
+                    /* iframe 还没加载 */
+                }
+            };
+            const onMessage = (event) => {
+                // 只认这个 iframe 的临时 origin；它是跨源的，父页面拿不到它的 window
+                if (event.origin !== host.origin) {
+                    return;
+                }
+                const data = event.data;
+                if (!data || data.__foliaScene !== 1) {
+                    return;
+                }
+                heard = true;
+                if (data.type === 'diag') {
+                    pushDiag('实时渲染', String(data.message ?? ''), data.level === 'error' ? 'error' : 'info');
+                    return;
+                }
+                if (data.type === 'error') {
+                    pushDiag('实时渲染', `引擎错误：${String(data.message ?? '')}`, 'error');
+                    noteAttempt('实时渲染', false, String(data.message ?? ''));
+                    if (!ready) {
+                        settle(false);
+                    }
+                    return;
+                }
+                if (data.type === 'luminance' && Number.isFinite(Number(data.value))) {
+                    sceneLuminance = Math.max(0, Math.min(1, Number(data.value)));
+                    paintReadability(sceneLuminance);
+                    return;
+                }
+                if (data.type === 'ready' && !ready) {
+                    ready = true;
+                    frame.classList.add('wp-eng-ready');
+                    info.textContent = formatCaption(item, 'live');
+                    noteAttempt('实时渲染', true, 'iframe 场景就绪');
+                    setTimeout(takePosterDown, 200);
+                    settle(true);
+                }
+            };
+            window.addEventListener('message', onMessage);
+
+            let stopAudio = null;
+            let stopMedia = null;
+            let stopPause = null;
+            const sendMedia = (force) => {
+                let state = null;
+                try {
+                    state = folium.playback?.getState?.() ?? null;
+                } catch {
+                    state = null;
+                }
                 const song = state?.song ?? null;
                 let cover = null;
                 try {
@@ -1473,58 +1630,130 @@ export default function activate(folium) {
                     cover = null;
                 }
                 const playing = state?.state === 'playing';
-                const position = Number(state?.position) || 0;
-                const init = {
-                    hasMedia: Boolean(song),
-                    playing,
-                    state: playing ? 1 : state?.state === 'paused' ? 2 : 0,
+                let thumbnail = '';
+                if (cover) {
+                    if (cover.startsWith('data:')) {
+                        thumbnail = cover;
+                    } else {
+                        const cached = coverCache.get(cover);
+                        if (cached) {
+                            thumbnail = cached;
+                        } else {
+                            coverToDataUrl(cover);
+                        }
+                    }
+                }
+                const payload = {
                     title: song?.title ?? '',
                     artist: song?.artist ?? '',
                     album: song?.album ?? '',
-                    position,
+                    position: Number(state?.position) || 0,
                     duration: Number(state?.duration) || 0,
-                    ...(cover ? { thumbnail: cover, hasThumbnail: true } : { hasThumbnail: false }),
+                    state: playing ? 1 : state?.state === 'paused' ? 2 : 0,
+                    thumbnail,
                 };
-                let source;
-                try {
-                    source = engine.createMediaSource(init);
-                } catch {
-                    return;
-                }
-                built = { key: signatureOf(state), at: Date.now(), position };
-                try {
-                    instance.setMedia(source);
-                } catch {
-                    /* 忽略 */
-                }
+                post({ type: 'media', media: payload, force: Boolean(force) });
             };
-            build();
-            if (typeof context.every !== 'function') {
-                return;
-            }
-            const stop = context.every(1000, () => {
-                const state = readPlayback();
-                if (!built || signatureOf(state) !== built.key) {
-                    build();
+            const cleanup = () => {
+                if (destroyed) {
                     return;
                 }
-                // 引擎按自己的时钟推进进度，和播放器差得多了就重建一次
-                const expected = built.position + (state?.state === 'playing' ? (Date.now() - built.at) / 1000 : 0);
-                if (Math.abs(expected - (Number(state?.position) || 0)) > 2) {
-                    build();
-                }
-            });
-            registerStop(() => {
+                destroyed = true;
+                settle(false);
+                window.removeEventListener('message', onMessage);
                 try {
-                    stop?.();
+                    stopAudio?.();
                 } catch {
                     /* 已释放 */
                 }
-            });
+                try {
+                    stopMedia?.();
+                } catch {
+                    /* 已释放 */
+                }
+                try {
+                    stopPause?.();
+                } catch {
+                    /* 已释放 */
+                }
+                takePosterDown();
+                if (sceneBridge && sceneBridge.frame === frame) {
+                    sceneBridge = null;
+                    sceneLuminance = null;
+                }
+                try {
+                    frame.src = 'about:blank';
+                } catch {
+                    /* 已移除 */
+                }
+                frame.remove();
+                try {
+                    folium.rpc.call('releaseSceneFrame', { id: item.id });
+                } catch {
+                    /* 主进程已经不在了 */
+                }
+            };
+            registerStop(cleanup);
+            sceneBridge = { frame, origin: host.origin, send: post };
+
+            if (typeof context.every === 'function') {
+                // 频谱 33ms 一帧；暂停时 fillAudioFrames 会统一衰减到 0
+                stopAudio = context.every(33, () => {
+                    const left = new Float32Array(64);
+                    const right = new Float32Array(64);
+                    fillAudioFrames(left, right);
+                    post({ type: 'audio', left, right }, [left.buffer, right.buffer]);
+                });
+                sendMedia(false);
+                stopMedia = context.every(1000, () => sendMedia(false));
+                let pausedState = null;
+                stopPause = context.every(250, () => {
+                    const paused = Boolean(settings.syncPause && context.isPaused());
+                    if (paused === pausedState) {
+                        return;
+                    }
+                    pausedState = paused;
+                    post({ type: paused ? 'pause' : 'resume' });
+                });
+            }
+
+            const timeout = setTimeout(() => {
+                if (!ready && !destroyed) {
+                    pushDiag('实时渲染', 'iframe 场景在 25 秒内没有就绪', 'error');
+                    noteAttempt('实时渲染', false, 'iframe-timeout');
+                    settle(false);
+                }
+            }, 25000);
+            // 宿主页面几秒内一句诊断都没有，说明页面/引擎根本没起来
+            const silent = setTimeout(() => {
+                if (!ready && !destroyed && !heard) {
+                    pushDiag('实时渲染', '场景宿主页面没有响应', 'error');
+                    noteAttempt('实时渲染', false, 'iframe-silent');
+                    settle(false);
+                }
+            }, 6000);
+
+            const ok = await readyPromise;
+            clearTimeout(timeout);
+            clearTimeout(silent);
+            if (destroyed || isCancelled()) {
+                cleanup();
+                return true;
+            }
+            if (!ok) {
+                cleanup();
+                return false;
+            }
+            // 就绪后强制再送一次：脚本初始化时可能还没收到媒体事件
+            sendMedia(true);
+            if (settings.syncPause && context.isPaused()) {
+                post({ type: 'pause' });
+            }
+            return true;
         };
 
         /* 最后一层兜底：只取 scene.pkg 里的背景原图；失败就返回 false，交给错误卡 */
-        const paintSceneArt = (item, isCancelled) => {
+        const paintSceneArt = (item, isCancelled, target) => {
             const url = artUrl(library, item);
             if (!url) {
                 pushDiag('单张原画', '这张壁纸没有可抽取的背景原图');
@@ -1557,7 +1786,7 @@ export default function activate(folium) {
                         return;
                     }
                     media = image;
-                    mediaWrap.append(image);
+                    target.append(image);
                     info.textContent = formatCaption(item, 'art');
                     startMotion();
                     refreshReadability();
@@ -1774,6 +2003,19 @@ export default function activate(folium) {
                     cover = null;
                 }
                 const playing = state?.state === 'playing';
+                let thumbnail = '';
+                if (cover) {
+                    if (cover.startsWith('data:')) {
+                        thumbnail = cover;
+                    } else {
+                        const cached = coverCache.get(cover);
+                        if (cached) {
+                            thumbnail = cached;
+                        } else {
+                            coverToDataUrl(cover);
+                        }
+                    }
+                }
                 post({
                     __foliaWe: 1,
                     kind: 'media',
@@ -1785,7 +2027,7 @@ export default function activate(folium) {
                         position: Number(state?.position) || 0,
                         duration: Number(state?.duration) || 0,
                         state: playing ? 1 : state?.state === 'paused' ? 2 : 0,
-                        ...(cover ? { thumbnail: cover, hasThumbnail: true } : { hasThumbnail: false }),
+                        ...(thumbnail ? { thumbnail, hasThumbnail: true } : { hasThumbnail: false }),
                     },
                 });
             };
@@ -1806,7 +2048,7 @@ export default function activate(folium) {
             };
         };
 
-        const paintWebFrame = (item, settings) => {
+        const paintWebFrame = (item, settings, target = mediaWrap) => {
             const frame = document.createElement('iframe');
             /*
              * 每张网页壁纸由主进程单独起一个临时 origin（自己的端口 + 随机路径），
@@ -1818,13 +2060,16 @@ export default function activate(folium) {
             // 不给 autoplay 授权：壁纸自带 BGM 不该出声（垫片里还会再钉一次静音）
             frame.setAttribute('allow', 'fullscreen');
             frame.referrerPolicy = 'no-referrer';
+            let poster = null;
             if (item.preview) {
-                const poster = document.createElement('img');
+                poster = document.createElement('img');
                 poster.src = httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview) ?? '';
+                poster.className = 'wp-eng-poster';
                 poster.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
-                mediaWrap.append(poster);
+                target.append(poster);
                 poster.addEventListener('error', () => {
-                    poster.remove();
+                    poster?.remove();
+                    poster = null;
                 }, { once: true });
             }
 
@@ -1854,7 +2099,7 @@ export default function activate(folium) {
                 }
             };
             media = frame;
-            mediaWrap.append(frame);
+            target.append(frame);
             cleanupMedia = release;
             startMotion();
             refreshReadability();
@@ -1876,6 +2121,8 @@ export default function activate(folium) {
                         if (released) {
                             return;
                         }
+                        poster?.remove();
+                        poster = null;
                         frame.classList.add('wp-eng-ready');
                         if (!stopPump) {
                             stopPump = pumpWebFrame(frame, host.origin);
@@ -1933,7 +2180,7 @@ export default function activate(folium) {
         };
 
         /* 预览用的廉价渲染：只要能看出是什么就行，不启动引擎 */
-        const paintPreviewStill = (item) => {
+        const paintPreviewStill = (item, target = mediaWrap) => {
             const url = item.custom
                 ? null
                 : (httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview));
@@ -1942,7 +2189,7 @@ export default function activate(folium) {
                 image.src = url;
                 image.style.objectFit = 'cover';
                 media = image;
-                mediaWrap.append(image);
+                target.append(image);
                 cleanupMedia = () => {
                     image.removeAttribute('src');
                 };
@@ -1954,7 +2201,7 @@ export default function activate(folium) {
                 image.src = art;
                 image.style.objectFit = 'cover';
                 media = image;
-                mediaWrap.append(image);
+                target.append(image);
                 cleanupMedia = () => {
                     image.removeAttribute('src');
                 };
@@ -1963,7 +2210,7 @@ export default function activate(folium) {
             return false;
         };
 
-        const show = (item) => {
+        const show = (item, target = mediaWrap) => {
             if (!item) {
                 return;
             }
@@ -1983,7 +2230,7 @@ export default function activate(folium) {
                     video.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
                     media = video;
                     customMedia = true;
-                    mediaWrap.append(video);
+                    target.append(video);
                     const onReady = () => {
                         refreshReadability();
                         if (context.isPaused() && settings.syncPause) {
@@ -2019,7 +2266,7 @@ export default function activate(folium) {
                 }, { once: true });
                 media = image;
                 customMedia = true;
-                mediaWrap.append(image);
+                target.append(image);
                 const onLoad = () => refreshReadability();
                 image.addEventListener('load', onLoad);
                 image.src = item.url;
@@ -2040,13 +2287,31 @@ export default function activate(folium) {
                 video.crossOrigin = 'anonymous';
                 video.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
                 media = video;
-                mediaWrap.append(video);
+                target.append(video);
+
+                // 视频首帧出来前先盖一张预览图，避免切换时露出旧画面或纯黑
+                const posterUrl = httpUrl(library, item, item.preview) ?? toFileUrl(item.absPreview);
+                let poster = null;
+                if (posterUrl) {
+                    poster = document.createElement('img');
+                    poster.className = 'wp-eng-poster';
+                    poster.src = posterUrl;
+                    poster.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
+                    target.append(poster);
+                    poster.addEventListener('error', () => {
+                        poster?.remove();
+                        poster = null;
+                    }, { once: true });
+                }
+
                 const detach = attachWithFallback(
                     video,
                     httpUrl(library, item, item.file),
                     toFileUrl(item.absFile),
                 );
                 const onReady = () => {
+                    poster?.remove();
+                    poster = null;
                     refreshReadability();
                     if (context.isPaused() && settings.syncPause) {
                         return;
@@ -2064,7 +2329,7 @@ export default function activate(folium) {
             }
 
             if (live === 'web' && item.file) {
-                paintWebFrame(item, settings);
+                paintWebFrame(item, settings, target);
                 return;
             }
 
@@ -2091,7 +2356,7 @@ export default function activate(folium) {
                 image.crossOrigin = 'anonymous';
                 image.style.objectFit = settings.fit === 'contain' || settings.fit === 'fill' ? settings.fit : 'cover';
                 media = image;
-                mediaWrap.append(image);
+                target.append(image);
                 const detach = attachChain(image, sources, (index) => {
                     info.textContent = formatCaption(item, sources[index]?.sharp === true ? 'art' : 'preview');
                     refreshReadability();
@@ -2102,10 +2367,20 @@ export default function activate(folium) {
             // 场景壁纸：实时渲染 → 合成静态图 → 单张原画；三层都不行就报错（不再退预览图）
             if (item.kind === 'scene') {
                 let cancelled = false;
-                stopLive = [];
+                /*
+                 * 每次挂载用自己的停止列表。旧场景的清理函数可能在下一张场景挂载之后
+                 * 才跑（交叉淡出），如果共用外面那个 stopLive，会把新引擎一起停掉。
+                 */
+                let stops = [];
+                let stopsOpen = true;
+                stopLive = stops;
                 const runStops = () => {
-                    const pending = stopLive ?? [];
-                    stopLive = null;
+                    if (!stopsOpen) {
+                        return;
+                    }
+                    stopsOpen = false;
+                    const pending = stops;
+                    stops = [];
                     pending.forEach((stop) => {
                         try {
                             stop();
@@ -2114,20 +2389,21 @@ export default function activate(folium) {
                         }
                     });
                 };
+                const addStop = (stop) => {
+                    if (stopsOpen) {
+                        stops.push(stop);
+                    } else {
+                        stop();
+                    }
+                };
                 const run = async () => {
-                    const liveOk = await liveScene(item, settings, () => cancelled || disposed, (stop) => {
-                        if (stopLive) {
-                            stopLive.push(stop);
-                        } else {
-                            stop();
-                        }
-                    });
+                    const liveOk = await liveScene(item, settings, () => cancelled || disposed, addStop, target);
                     let fallback = null;
                     if (!liveOk && !cancelled && !disposed) {
-                        fallback = await compositeScene(item, () => cancelled || disposed) ? '合成静态图' : null;
+                        fallback = await compositeScene(item, () => cancelled || disposed, target) ? '合成静态图' : null;
                     }
                     if (!liveOk && !fallback && !cancelled && !disposed) {
-                        fallback = await paintSceneArt(item, () => cancelled || disposed) ? '单张原画' : null;
+                        fallback = await paintSceneArt(item, () => cancelled || disposed, target) ? '单张原画' : null;
                     }
                     if (cancelled || disposed) {
                         return;
@@ -2241,8 +2517,7 @@ export default function activate(folium) {
                     return;
                 }
                 currentKey = item.id;
-                teardownMedia();
-                show(item);
+                swapTo((layer) => show(item, layer));
                 applyFilters();
                 return;
             }
@@ -2268,8 +2543,7 @@ export default function activate(folium) {
                 return;
             }
             currentKey = item.id;
-            teardownMedia();
-            show(item);
+            swapTo((layer) => show(item, layer));
             applyFilters();
         };
 
@@ -2322,19 +2596,16 @@ export default function activate(folium) {
 
         // 场景的鼠标视差：把窗口指针位置喂给引擎（u/v 归一化）
         const onPointerMove = (event) => {
-            if (!liveInstance || typeof liveInstance.pushPointer !== 'function') {
+            if (!sceneBridge) {
                 return;
             }
-            try {
-                liveInstance.pushPointer(
-                    event.clientX / Math.max(1, window.innerWidth),
-                    event.clientY / Math.max(1, window.innerHeight),
-                    event.buttons ?? 0,
-                    (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0),
-                );
-            } catch {
-                /* 引擎还没装配完 */
-            }
+            sceneBridge.send({
+                type: 'pointer',
+                x: event.clientX / Math.max(1, window.innerWidth),
+                y: event.clientY / Math.max(1, window.innerHeight),
+                buttons: event.buttons ?? 0,
+                mods: (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0),
+            });
         };
         if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
             window.addEventListener('pointermove', onPointerMove, { passive: true });
@@ -2406,7 +2677,7 @@ export default function activate(folium) {
     // -----------------------------------------------------------------------
 
     const mountSettingsPanel = (container, panelContext) => {
-        const state = { tab: 'wallpaper', query: '', busy: false, message: '' };
+        const state = { tab: 'wallpaper', query: '', busy: false, message: '', pickerScroll: 0 };
 
         const style = document.createElement('style');
         style.textContent = `
@@ -2482,6 +2753,11 @@ export default function activate(folium) {
         const paint = () => {
             const colors = themeColors();
             const settings = panelContext.settings.get();
+            // 选壁纸会重建面板，先把列表滚动位置记下来，重建后恢复
+            const oldGrid = typeof root.querySelector === 'function' ? root.querySelector('.wp-eng-grid') : null;
+            if (oldGrid) {
+                state.pickerScroll = oldGrid.scrollTop || 0;
+            }
             root.replaceChildren();
             root.style.color = colors.text;
             root.style.setProperty('--wp-muted', colors.muted);
@@ -2732,7 +3008,9 @@ export default function activate(folium) {
             search.value = state.query;
             search.addEventListener('input', () => {
                 state.query = search.value;
+                state.pickerScroll = 0;
                 renderGrid();
+                grid.scrollTop = 0;
             });
             root.append(search);
 
@@ -2764,6 +3042,7 @@ export default function activate(folium) {
                     }));
                     card.append(el('div', { className: 'wp-eng-name', text: item.title }));
                     card.addEventListener('click', () => {
+                        state.pickerScroll = grid.scrollTop || state.pickerScroll || 0;
                         writeState({ wallpaperId: item.id }).then(() => {
                             if (panelContext.settings.get().mode !== 'fixed') {
                                 panelContext.settings.set({ mode: 'fixed' });
@@ -2776,7 +3055,11 @@ export default function activate(folium) {
             };
 
             renderGrid();
+            grid.addEventListener('scroll', () => {
+                state.pickerScroll = grid.scrollTop;
+            }, { passive: true });
             root.append(grid);
+            grid.scrollTop = state.pickerScroll || 0;
             root.append(el('div', {
                 className: 'wp-eng-hint',
                 text: '「场景」是 Wallpaper Engine 的多层 2.5D 壁纸，画面封在 scene.pkg 里。这里按原图层顺序把各层贴图叠回完整画面（4K 级），叠加角色与前景都在；只有特效/着色器那一层无法还原。',

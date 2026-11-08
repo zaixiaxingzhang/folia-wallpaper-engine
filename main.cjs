@@ -753,6 +753,255 @@ const startWebServer = (item) => new Promise((resolve, reject) => {
 });
 
 /*
+ * 场景宿主页面：引擎和 SceneScript 都在这个 iframe 里跑，父页面（Folia）
+ * 只通过 postMessage 给它送频谱、媒体信息、指针和暂停状态。这样脚本拿到的
+ * window 是 iframe 自己的，碰不到宿主页面；CSP 又把它限制在自己的临时 origin 内。
+ */
+const SCENE_CSP = [
+    "default-src 'self' data: blob:",
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' data: blob:",
+    "font-src 'self' data: blob:",
+    "connect-src 'self' data: blob:",
+    "worker-src 'self' blob:",
+    "frame-src 'none'",
+    "object-src 'none'",
+    "form-action 'none'",
+    "base-uri 'self'",
+].join('; ');
+
+const SCENE_HOST = `<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}canvas{display:block}</style></head>
+<body>
+<script src="engine.js"></script>
+<script>
+(function () {
+    var post = function (type, extra) {
+        try { parent.postMessage(Object.assign({ __foliaScene: 1, type: type }, extra || {}), '*'); } catch (e) {}
+    };
+    var params = new URLSearchParams(location.search);
+    var left = new Float32Array(64);
+    var right = new Float32Array(64);
+    var ready = false;
+    var mediaKey = '';
+    var mediaPos = 0;
+    var instance = null;
+    function sendReady() {
+        if (ready) return;
+        ready = true;
+        post('ready');
+    }
+    window.addEventListener('error', function (event) {
+        // 场景脚本/字体偶发报错很常见，记日志但不当作致命失败
+        post('diag', { level: 'warn', message: String(event.message || event) });
+    });
+    try {
+        if (!window.WebWallGL) {
+            post('error', { message: 'engine not loaded' });
+            return;
+        }
+        instance = WebWallGL.createScene(document.body, {
+            fit: params.get('fit') === 'contain' ? 'contain' : params.get('fit') === 'fill' ? 'stretch' : 'cover',
+            fps: Math.max(15, Math.min(60, Number(params.get('fps')) || 30)),
+            volume: 0,
+            autoplay: true,
+            scripts: true,
+            onDiagnostic: function (message, level) {
+                post('diag', { level: level, message: String(message) });
+                if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
+                    setTimeout(sendReady, 800);
+                }
+            },
+            onError: function (error) {
+                post('error', { message: String(error && error.message || error) });
+            }
+        });
+        instance.setAudio({ snapshot: function () { return { left: left, right: right }; } });
+        instance.load(WebWallGL.httpSource('pkg')).then(function () {
+            sendReady();
+        }, function (error) {
+            post('error', { message: 'load: ' + String(error && error.message || error) });
+        });
+    } catch (error) {
+        post('error', { message: 'create: ' + String(error && error.message || error) });
+        return;
+    }
+    addEventListener('message', function (event) {
+        var data = event.data;
+        if (!data || data.__foliaSceneIn !== 1) return;
+        if (data.type === 'audio' && data.left && data.right) {
+            left.set(data.left);
+            right.set(data.right);
+            return;
+        }
+        if (data.type === 'media') {
+            var media = data.media || {};
+            var key = [media.title || '', media.artist || '', media.album || '', media.state || 0, media.thumbnail || ''].join('|');
+            var pos = Number(media.position) || 0;
+            var applyMedia = function () {
+                mediaKey = key;
+                mediaPos = pos;
+                try {
+                    instance.setMedia(WebWallGL.createMediaSource({
+                        hasMedia: Boolean(media.title),
+                        playing: media.state === 1,
+                        state: Number(media.state) || 0,
+                        title: media.title || '',
+                        artist: media.artist || '',
+                        album: media.album || '',
+                        position: pos,
+                        duration: Number(media.duration) || 0,
+                        thumbnail: media.thumbnail || '',
+                        hasThumbnail: Boolean(media.thumbnail),
+                    }));
+                    // 场景直跑模式下引擎不会把媒体事件派给脚本；用它的公开调试入口补一次
+                    if (typeof window.__mediaSet === 'function') {
+                        window.__mediaSet({
+                            hasMedia: Boolean(media.title),
+                            state: Number(media.state) || 0,
+                            title: media.title || '',
+                            artist: media.artist || '',
+                            album: media.album || '',
+                            albumArtist: media.artist || '',
+                            position: pos,
+                            duration: Number(media.duration) || 0,
+                            hasThumbnail: Boolean(media.thumbnail),
+                            thumbnail: media.thumbnail || '',
+                        });
+                    }
+                } catch (e) {}
+            };
+            if (data.force) {
+                // 脚本初始化时可能已经吞掉了第一次媒体快照；先清空再送，
+                // 让引擎按“空 → 有媒体”重新派发 mediaPropertiesChanged
+                try {
+                    instance.setMedia(WebWallGL.createMediaSource({
+                        hasMedia: false, state: 0, title: '', artist: '', album: '',
+                        position: 0, duration: 0, hasThumbnail: false,
+                    }));
+                    if (typeof window.__mediaSet === 'function') {
+                        window.__mediaSet({ hasMedia: false, state: 0, title: '', artist: '', album: '', albumArtist: '', position: 0, duration: 0, hasThumbnail: false, thumbnail: '' });
+                    }
+                } catch (e) {}
+                mediaKey = '';
+                mediaPos = -999;
+                setTimeout(applyMedia, 120);
+                return;
+            }
+            if (key === mediaKey && Math.abs(pos - mediaPos) < 2) return;
+            applyMedia();
+            return;
+        }
+        if (data.type === 'pointer') {
+            try { instance.pushPointer(data.x, data.y, data.buttons, data.mods); } catch (e) {}
+            return;
+        }
+        if (data.type === 'pause') {
+            try { instance.pause(); } catch (e) {}
+            return;
+        }
+        if (data.type === 'resume') {
+            try { instance.resume(); } catch (e) {}
+        }
+    });
+    setInterval(function () {
+        try {
+            var canvas = instance.canvas || document.querySelector('canvas');
+            if (!canvas || !canvas.width) return;
+            var probe = document.createElement('canvas');
+            probe.width = 32;
+            probe.height = 18;
+            var ctx = probe.getContext('2d');
+            ctx.drawImage(canvas, 0, 0, 32, 18);
+            var data = ctx.getImageData(0, 0, 32, 18).data;
+            var sum = 0;
+            for (var i = 0; i < data.length; i += 4) {
+                sum += (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+            }
+            post('luminance', { value: sum / (data.length / 4) });
+        } catch (e) {}
+    }, 2500);
+})();
+</script>
+</body></html>`;
+
+/*
+ * 场景宿主服务：每张场景一个临时 origin，只挂它自己的目录。
+ * 页面、引擎和 scene.pkg 都从同一个 origin 取，脚本无法访问主服务和别的壁纸。
+ */
+const startSceneServer = (item) => new Promise((resolve, reject) => {
+    const token = crypto.randomBytes(16).toString('hex');
+    const tokenPrefix = `/${token}`;
+    const root = item.dir;
+    const enginePath = path.join(__dirname, 'vendor', 'webwallgl.global.min.js');
+    const server = http.createServer(async (request, response) => {
+        try {
+            const url = new URL(request.url, 'http://127.0.0.1');
+            if (url.pathname !== tokenPrefix && !url.pathname.startsWith(`${tokenPrefix}/`)) {
+                response.writeHead(404, { 'Cache-Control': 'no-store' });
+                response.end();
+                return;
+            }
+            if (request.method !== 'GET' && request.method !== 'HEAD') {
+                response.writeHead(405, { 'Cache-Control': 'no-store' });
+                response.end();
+                return;
+            }
+            url.pathname = url.pathname.slice(tokenPrefix.length) || '/';
+            if (url.pathname === '/host.html') {
+                const body = Buffer.from(SCENE_HOST, 'utf8');
+                response.writeHead(200, {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Content-Length': String(body.length),
+                    'Content-Security-Policy': SCENE_CSP,
+                    'Cache-Control': 'no-store',
+                });
+                response.end(request.method === 'HEAD' ? undefined : body);
+                return;
+            }
+            if (url.pathname === '/engine.js') {
+                await serveFile(request, response, enginePath, {}, tokenPrefix);
+                return;
+            }
+            if (url.pathname.startsWith('/pkg/')) {
+                const segments = url.pathname.slice('/pkg/'.length).split('/').filter(Boolean).map((segment) => decodeURIComponent(segment));
+                if (segments.length === 0
+                    || segments.some((segment) => segment === '..' || segment === '.' || segment.includes('\\') || segment.includes('/') || path.isAbsolute(segment))) {
+                    response.writeHead(400, { 'Cache-Control': 'no-store' });
+                    response.end('Invalid path');
+                    return;
+                }
+                const target = path.resolve(root, ...segments);
+                if (!target.startsWith(root + path.sep)) {
+                    response.writeHead(403, { 'Cache-Control': 'no-store' });
+                    response.end('Forbidden');
+                    return;
+                }
+                await serveFile(request, response, target, {}, tokenPrefix);
+                return;
+            }
+            response.writeHead(404, { 'Cache-Control': 'no-store' });
+            response.end('Not found');
+        } catch (error) {
+            try {
+                response.writeHead(500, { 'Cache-Control': 'no-store' });
+                response.end(String(error && error.message));
+            } catch {
+                /* 连接已经断了 */
+            }
+        }
+    });
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        const origin = `http://127.0.0.1:${address.port}`;
+        resolve({ server, token, origin, base: `${origin}/${token}`, dir: root });
+    });
+});
+
+/*
  * 启动 HTTP 服务。端口由系统分配（0），只监听 127.0.0.1，外部不可达。
  * 路由：
  *   GET /health                  存活探测
@@ -990,6 +1239,26 @@ module.exports = function activate(api) {
         [...webHosts.keys()].forEach(closeWebHost);
     };
 
+    // 场景宿主（引擎 + SceneScript 跑在 iframe 里），按场景 id 复用
+    const sceneHosts = new Map();
+    const sceneStarting = new Map();
+
+    const closeSceneHost = (id) => {
+        const host = sceneHosts.get(id);
+        if (!host) {
+            return;
+        }
+        sceneHosts.delete(id);
+        try {
+            host.server.close();
+        } catch {
+            /* 已经关了 */
+        }
+    };
+    const closeAllSceneHosts = () => {
+        [...sceneHosts.keys()].forEach(closeSceneHost);
+    };
+
     let scanInFlight = null;
 
     /*
@@ -1119,6 +1388,66 @@ module.exports = function activate(api) {
         return { ok: true };
     });
 
+    /*
+     * 场景宿主：渲染端拿到的 iframe 地址。引擎和 SceneScript 都在这个临时 origin
+     * 里跑，父页面只负责把频谱/媒体/指针 post 进去。
+     */
+    api.rpc.handle('sceneFrame', async (options) => {
+        const id = String(options?.id ?? '');
+        if (!id) {
+            return { ok: false, error: 'bad-id' };
+        }
+        const current = await ensureLibrary(false);
+        const item = current.items.find((entry) => entry.id === id);
+        if (!item || item.kind !== 'scene' || !item.dir) {
+            return { ok: false, error: 'not-a-scene-wallpaper' };
+        }
+        let host = sceneHosts.get(id);
+        if (host && host.dir !== item.dir) {
+            closeSceneHost(id);
+            host = null;
+        }
+        if (!host) {
+            let pending = sceneStarting.get(id);
+            if (!pending) {
+                pending = startSceneServer(item).then((started) => {
+                    started.refs = 0;
+                    sceneHosts.set(id, started);
+                    sceneStarting.delete(id);
+                    return started;
+                }).catch((error) => {
+                    sceneStarting.delete(id);
+                    throw error;
+                });
+                sceneStarting.set(id, pending);
+            }
+            try {
+                host = await pending;
+            } catch (error) {
+                return { ok: false, error: String(error?.message ?? error) };
+            }
+        }
+        host.refs += 1;
+        const query = new URLSearchParams({
+            fit: String(options?.fit ?? 'cover'),
+            fps: String(Math.max(15, Math.min(60, Number(options?.fps) || 30))),
+        });
+        return { ok: true, url: `${host.base}/host.html?${query.toString()}`, origin: host.origin };
+    });
+
+    api.rpc.handle('releaseSceneFrame', (options) => {
+        const id = String(options?.id ?? '');
+        const host = sceneHosts.get(id);
+        if (!host) {
+            return { ok: true };
+        }
+        host.refs = Math.max(0, (host.refs ?? 1) - 1);
+        if (host.refs === 0) {
+            closeSceneHost(id);
+        }
+        return { ok: true };
+    });
+
     // 兜底：渲染端第一次拿到 base 之前先要知道端口
     /*
      * 用系统默认浏览器打开链接。
@@ -1169,6 +1498,7 @@ module.exports = function activate(api) {
 
     api.onDispose(() => {
         closeAllWebHosts();
+        closeAllSceneHosts();
         if (server) {
             try {
                 server.close();
@@ -1181,6 +1511,7 @@ module.exports = function activate(api) {
 
     return () => {
         closeAllWebHosts();
+        closeAllSceneHosts();
         if (server) {
             try {
                 server.close();

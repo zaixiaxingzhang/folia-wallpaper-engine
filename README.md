@@ -44,6 +44,9 @@
 - **选择器预览不启动引擎**：背景选择器悬停时会挂载背景拍快照。检测到预览容器
   （小尺寸、隐藏、在视口外或 `staticMode`）时只铺一张静态预览图，不创建 WebGL。
 - **重渲染防抖 160ms**：拖滑杆、连续换壁纸时只挂载最后一次，避免反复建/毁引擎。
+- **双缓冲交叉淡入**：旧壁纸保留到新壁纸就绪，240ms 淡入淡出；场景/视频/网页在
+  加载期间先铺静态海报，不再先黑一块。
+- **选择器保持滚动位置**：点选壁纸后面板重建也不会跳回列表顶部。
 - 容器尺寸在预览与正式之间切换时会重新判定路径。
 - **主进程没有同步 IO**：扫描、`project.json`、`serveFile`、`scene.pkg` 全部走
   `fs.promises`；扫描限制并发，同一时间只扫一次。
@@ -58,6 +61,9 @@
 - `scene.cjs`：`scene.pkg` 的解析（表头 + 相对偏移 + 内嵌 PNG/JPEG 抽帧），用于引擎
   不可用时的静态兜底：按 `scene.json` 的绘制顺序把各层贴图叠回一张完整画面。
 - `client.mjs`：注册背景类型、渲染层、叠色计算、设置面板。
+- 场景实时渲染：主进程为每张场景起一个临时 origin，`host.html` 在里面加载
+  `vendor/webwallgl.global.min.js` 并执行 SceneScript；父页面只通过 postMessage
+  送频谱、媒体、指针和暂停状态。引擎不再加载进 Folia 页面。
 - `vendor/webwallgl.global.min.js`：第三方实时渲染引擎，见 `THIRD_PARTY_NOTICES.txt`。
 
 引擎不可用或解析失败时按 **实时渲染 → 合成静态图 → 单张原画** 逐级自动降级（没有开关）。
@@ -68,9 +74,10 @@
 
 ## 安全
 
-- **不执行壁纸自带的 SceneScript**：引擎用 `new Function` 求值这些脚本，脚本可以绕到
-  `window` 拿到宿主页面，所以一律关掉（`scripts: false`）。代价是场景里的时钟、文字、
-  属性联动停在 `scene.json` 的快照值；图层动画、粒子、着色器照常运行。
+- **SceneScript 只在独立 origin 的 iframe 里执行**：每张场景一个临时端口 + 随机路径，
+  引擎和脚本都在这个 iframe 内，CSP `connect-src 'self'` 把它限制在自己的 origin。
+  父页面（Folia）不加载引擎、也不执行壁纸脚本；脚本拿到的 `window` 是 iframe 自己的，
+  碰不到 `folium` 接口和宿主 DOM。歌名 / 时长 / 时钟 / 播放器 UI 因此可以恢复。
 - **本机服务带随机路径前缀**：每次启动生成 32 位十六进制 token，所有接口都在
   `/<token>/…` 下；没有 token 一律 404，别的网页扫端口也读不到。
 - **CORS 只对 `Origin: null` 放行**（Folia 的 `file://` 渲染端），
@@ -83,8 +90,8 @@
   不靠 opaque origin。
 - **网页壁纸带 CSP**：`connect-src 'self'`、`img-src 'self' data: blob:` 等，
   外网请求和其他本机端口发不出去；本地资源、Worker、WebAssembly 与音频响应照常。
-- **已知限制**：CSP 拦不住网页壁纸把自身 frame 导航到外部地址。它手里只有当前曲目信息，
-  没有主服务 token、壁纸列表或其他文件，风险很低。
+- **已知限制**：CSP 拦不住网页壁纸/场景 iframe 把自身 frame 导航到外部地址。它们手里只有
+  当前曲目信息和自己的壁纸文件，没有主服务 token、壁纸列表，风险很低。
 
 ## 权限
 
