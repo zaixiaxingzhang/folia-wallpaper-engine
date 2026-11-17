@@ -36,6 +36,10 @@ export default function activate(folium) {
 
     let libraryCache = null;
     let libraryPromise = null;
+    // 当前正在显示的壁纸 id（随机/跟随桌面模式下由挂载流程写入，设置面板据此展示属性）
+    let activeWallpaperId = null;
+    // 属性改了要强制重挂一次背景（同一张壁纸时 mount 会走快路径不重建 iframe）
+    let forceRemount = false;
 
     /*
      * WebWallGL：MIT 许可的场景渲染器（vendor/webwallgl.global.min.js）。
@@ -370,6 +374,62 @@ export default function activate(folium) {
         notify();
     };
 
+    /*
+     * 壁纸用户属性（WE 的 project.json → general.properties）：
+     * 用户在这里调过的值按壁纸 id 存一份，渲染时交给场景引擎。
+     * 结构：{ [wallpaperId]: { [propName]: value } }
+     */
+    const readUserProps = async () => {
+        try {
+            const value = await folium.storage.get('userProps');
+            return value && typeof value === 'object' ? value : {};
+        } catch {
+            return {};
+        }
+    };
+
+    /*
+     * 属性写入串行化：并发写会各自「读全量 → 合并 → 写全量」，
+     * 后写的把先写的覆盖掉。用户连着调很多属性时，后面的不生效就是这么来的。
+     */
+    let propsWriteChain = Promise.resolve();
+    const writeUserProps = (wallpaperId, patch) => {
+        const run = async () => {
+            try {
+                const all = await readUserProps();
+                const next = { ...all };
+                if (patch === null) {
+                    delete next[wallpaperId];
+                } else {
+                    const current = { ...(next[wallpaperId] || {}), ...patch };
+                    for (const key of Object.keys(current)) {
+                        if (current[key] === undefined) {
+                            delete current[key];
+                        }
+                    }
+                    if (Object.keys(current).length) {
+                        next[wallpaperId] = current;
+                    } else {
+                        delete next[wallpaperId];
+                    }
+                }
+                await folium.storage.set('userProps', next);
+                // 壁纸模式下背景在另一个窗口，通知主进程广播给所有窗口
+                try {
+                    await folium.rpc.call('propsChanged', {});
+                } catch (error) {
+                    void error;
+                }
+            } catch (error) {
+                console.warn('[壁纸引擎] 保存壁纸属性失败', error);
+            }
+            // 不设 forceRemount：场景靠轮询直接收新属性，重挂只会黑一下
+            notify();
+        };
+        propsWriteChain = propsWriteChain.then(run, run);
+        return propsWriteChain;
+    };
+
     const SETTINGS = [
         {
             key: 'library', type: 'select', defaultValue: 'we',
@@ -403,6 +463,18 @@ export default function activate(folium) {
                 { value: 'song', label: t('每次切歌', 'Song change') },
                 { value: 'hour', label: t('每小时', 'Every hour') },
                 { value: 'session', label: t('每次启动', 'App launch') },
+            ],
+        },
+        {
+            key: 'timerMinutes', type: 'select', defaultValue: '0',
+            label: t('定时轮换', 'Auto rotate'),
+            description: t('伪随机模式下每隔几分钟自动换一张；0 关闭。和「重新抽取时机」同时生效时以本项为准', 'In pseudo-random mode, switch wallpaper every N minutes; 0 turns it off. Takes priority over the reshuffle timing above'),
+            options: [
+                { value: '0', label: t('关闭', 'Off') },
+                { value: '10', label: t('每 10 分钟', '10 min') },
+                { value: '30', label: t('每 30 分钟', '30 min') },
+                { value: '60', label: t('每小时', '1 hour') },
+                { value: '120', label: t('每 2 小时', '2 hours') },
             ],
         },
         {
@@ -599,6 +671,11 @@ export default function activate(folium) {
     };
 
     const shuffleKey = (settings, context) => {
+        // 定时轮换优先：按 N 分钟切片，切片一换就抽新的一张
+        const timerMinutes = Number(settings.timerMinutes) || 0;
+        if (timerMinutes > 0) {
+            return `t${Math.floor(Date.now() / (timerMinutes * 60_000))}`;
+        }
         if (settings.reshuffle === 'hour') {
             return `h${Math.floor(Date.now() / 3_600_000)}`;
         }
@@ -1494,10 +1571,12 @@ export default function activate(folium) {
         const liveScene = async (item, settings, isCancelled, registerStop, target = mediaWrap) => {
             let host;
             try {
+                const userProps = await readUserProps();
                 host = await folium.rpc.call('sceneFrame', {
                     id: item.id,
                     fit: settings.fit,
                     fps: settings.sceneFps,
+                    props: userProps[item.id] ?? {},
                 });
             } catch (error) {
                 pushDiag('实时渲染', `场景宿主请求失败：${error?.message ?? error}`);
@@ -1743,6 +1822,16 @@ export default function activate(folium) {
             if (!ok) {
                 cleanup();
                 return false;
+            }
+            /*
+             * 场景就绪后主动推一次最新属性：挂载过程中改的设置，
+             * propsPoll 那时 sceneBridge 还是 null，会漏掉。
+             */
+            try {
+                const latest = await readUserProps();
+                post({ type: 'props', props: latest[item.id] ?? {} });
+            } catch (error) {
+                void error;
             }
             // 就绪后强制再送一次：脚本初始化时可能还没收到媒体事件
             sendMedia(true);
@@ -2512,10 +2601,11 @@ export default function activate(folium) {
                 };
                 info.classList.remove('wp-eng-visible');
                 info.textContent = formatCaption(item, false);
-                if (item.id === currentKey && media) {
+                if (!forceRemount && item.id === currentKey && media) {
                     applyFilters();
                     return;
                 }
+                forceRemount = false;
                 currentKey = item.id;
                 swapTo((layer) => show(item, layer));
                 applyFilters();
@@ -2535,16 +2625,33 @@ export default function activate(folium) {
                 paintReadability(0.06);
                 info.textContent = library?.error ? '壁纸引擎：未找到壁纸库' : '壁纸引擎：没有可用壁纸';
                 info.classList.add('wp-eng-visible');
+                setActiveWallpaper(null);
                 return;
             }
+            setActiveWallpaper(item);
             info.textContent = formatCaption(item, false);
-            if (item.id === currentKey && media) {
+            if (!forceRemount && item.id === currentKey && media) {
                 applyFilters();
                 return;
             }
+            forceRemount = false;
             currentKey = item.id;
             swapTo((layer) => show(item, layer));
             applyFilters();
+        };
+
+        // 记录当前显示的壁纸，设置面板据此展示「正在显示」的属性
+        const setActiveWallpaper = (item) => {
+            const nextId = item?.id ?? null;
+            if (nextId === activeWallpaperId) {
+                return;
+            }
+            activeWallpaperId = nextId;
+            try {
+                notifyPanel();
+            } catch (error) {
+                void error;
+            }
         };
 
         const formatCaption = (item, mode) => {
@@ -2583,6 +2690,70 @@ export default function activate(folium) {
         listeners.add(onSelectionChange);
 
         render().catch((error) => console.warn('[壁纸引擎] 挂载失败', error));
+
+        /*
+         * 定时轮换：时间片一变就重新抽一张。只在伪随机模式下有意义，
+         * 指定壁纸 / 跟随桌面时跳过。
+         */
+        let lastRotateKey = '';
+        const stopRotate = typeof context.every === 'function'
+            ? context.every(15_000, () => {
+                const settings = context.getSettings();
+                if (!(Number(settings.timerMinutes) > 0)) {
+                    lastRotateKey = '';
+                    return;
+                }
+                if (settings.mode === 'fixed' || settings.mode === 'desktop') {
+                    return;
+                }
+                let key;
+                try {
+                    key = shuffleKey(settings, context);
+                } catch {
+                    return;
+                }
+                if (lastRotateKey === '') {
+                    lastRotateKey = key;
+                    return;
+                }
+                if (key !== lastRotateKey) {
+                    lastRotateKey = key;
+                    scheduleRender();
+                }
+            })
+            : null;
+
+        /*
+         * 壁纸模式下设置面板和背景不在同一个窗口，rpc 广播不一定能到这边窗口。
+         * 轮询属性存储兜底：值变了就强制重挂一次。
+         */
+        let lastPropsJson = '';
+        const propsPoll = setInterval(async () => {
+            try {
+                const stored = await readUserProps();
+                const json = JSON.stringify(stored);
+                if (lastPropsJson === '') {
+                    lastPropsJson = json;
+                } else if (json !== lastPropsJson) {
+                    lastPropsJson = json;
+                    /*
+                     * 直接把新属性推给运行中的场景，不重建 iframe。
+                     * 之前靠 forceRemount 重挂：会黑一下，连续调多个属性时还会互相打断，
+                     * 结果就是「后面的改动不生效」。
+                     */
+                    const activeId = activeWallpaperId;
+                    if (sceneBridge && activeId) {
+                        try {
+                            sceneBridge.send({ type: 'props', props: stored[activeId] ?? {} });
+                        } catch (error) {
+                            void error;
+                        }
+                    }
+                }
+            } catch (error) {
+                void error;
+            }
+        }, 1500);
 
         /*
          * 设置变了、切歌了、播放/暂停了，宿主都会通知。
@@ -2634,6 +2805,16 @@ export default function activate(folium) {
         return () => {
             disposed = true;
             listeners.delete(onSelectionChange);
+            try {
+                clearInterval(propsPoll);
+            } catch (error) {
+                void error;
+            }
+            try {
+                stopRotate?.();
+            } catch (error) {
+                void error;
+            }
             if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
                 window.removeEventListener('pointermove', onPointerMove);
             }
@@ -2707,6 +2888,10 @@ export default function activate(folium) {
             }
             .wp-eng-card video { width: 100%; height: 100%; object-fit: cover; display: block; }
             .wp-eng-card.wp-eng-missing { opacity: 0.45; }
+            .wp-eng-props input[type="range"] { width: 100%; accent-color: var(--wp-accent); }
+            .wp-eng-props input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--wp-accent); }
+            .wp-eng-props input[type="color"] { width: 38px; height: 26px; padding: 1px; border: 1px solid var(--wp-border); border-radius: 6px; background: var(--wp-surface); }
+            .wp-eng-props input[type="text"], .wp-eng-props select { background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border); border-radius: 8px; padding: 5px 8px; font-size: 11.5px; }
         `;
         const root = document.createElement('div');
         root.className = 'wp-eng-panel';
@@ -2726,11 +2911,37 @@ export default function activate(folium) {
             }
         };
 
-        const mix = (hex, amount) => {
-            const rgb = hexToRgb(hex) ?? [20, 20, 24];
-            const target = amount >= 0 ? 255 : 0;
-            const ratio = Math.abs(amount);
-            return `rgb(${rgb.map((value) => Math.round(value + (target - value) * ratio)).join(', ')})`;
+
+        // 读面板容器的实际背景色判断应用深浅色（面板由 Folia 主题渲染）
+        const detectAppDark = () => {
+            try {
+                const html = document.documentElement;
+                const scheme = String(getComputedStyle(html).colorScheme || '').toLowerCase();
+                if (scheme.includes('dark')) return true;
+                if (scheme.includes('light')) return false;
+                const attr = String(html.getAttribute('data-theme') || html.getAttribute('data-color-scheme') || html.className || '').toLowerCase();
+                if (/dark/.test(attr)) return true;
+                if (/light/.test(attr)) return false;
+                const luminance = (cssColor) => {
+                    const match = /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/.exec(String(cssColor || ''));
+                    if (!match) return null;
+                    if (match[4] !== undefined && Number(match[4]) < 0.5) return null;
+                    return 0.2126 * Number(match[1]) + 0.7152 * Number(match[2]) + 0.0722 * Number(match[3]);
+                };
+                // 应用文字色最可靠：浅色主题是深色字，深色主题是浅色字
+                const textLum = luminance(container && getComputedStyle(container).color)
+                    ?? luminance(document.body && getComputedStyle(document.body).color);
+                if (textLum !== null) return textLum > 128;
+                const candidates = [container, container && container.parentElement, document.body, document.documentElement];
+                for (const node of candidates) {
+                    if (!node) continue;
+                    const lum = luminance(getComputedStyle(node).backgroundColor);
+                    if (lum !== null) return lum < 128;
+                }
+            } catch (error) {
+                void error;
+            }
+            return false;
         };
 
         const el = (tag, options = {}) => {
@@ -2759,8 +2970,17 @@ export default function activate(folium) {
                 state.pickerScroll = oldGrid.scrollTop || 0;
             }
             root.replaceChildren();
-            root.style.color = colors.text;
-            root.style.setProperty('--wp-muted', colors.muted);
+            // 控件跟随 Folia 应用的深浅色（播放页主题的配色不一定是应用明暗）
+            const appDark = detectAppDark();
+            root.style.color = appDark ? '#f2f2f5' : '#1b1b1f';
+            root.style.setProperty('--wp-muted', appDark ? 'rgba(242,242,245,0.62)' : 'rgba(27,27,31,0.58)');
+            root.style.setProperty('--wp-accent', colors.accent);
+            root.style.setProperty('--wp-surface', appDark ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.08)');
+            root.style.setProperty('--wp-surface-strong', appDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)');
+            root.style.setProperty('--wp-text', appDark ? '#f2f2f5' : '#1b1b1f');
+            root.style.setProperty('--wp-border', appDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.22)');
+            // 让原生控件（color picker / checkbox / range / select）也跟着明暗走
+            root.style.colorScheme = appDark ? 'dark' : 'light';
 
             // 顶部：标题 + 库状态
             const head = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
@@ -2772,7 +2992,7 @@ export default function activate(folium) {
             const refresh = el('button', {
                 className: 'wp-eng-btn',
                 text: state.busy ? '扫描中…' : '重新扫描',
-                style: `background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.8)};`,
+                style: `background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border);`,
             });
             refresh.addEventListener('click', async () => {
                 if (state.busy) {
@@ -2793,14 +3013,14 @@ export default function activate(folium) {
             root.append(head);
 
             // 标签页
-            const tabs = el('div', { className: 'wp-eng-tabs', style: `background: ${mix(colors.text, -0.88)};` });
+            const tabs = el('div', { className: 'wp-eng-tabs', style: `background: var(--wp-surface-strong);` });
             [['wallpaper', '壁纸'], ['display', '显示']].forEach(([key, text]) => {
                 const tab = el('button', {
                     className: 'wp-eng-tab',
                     text,
                     style: state.tab === key
-                        ? `background: ${mix(colors.text, -0.72)}; color: ${colors.text};`
-                        : `color: ${colors.muted};`,
+                        ? `background: var(--wp-surface); color: var(--wp-text);`
+                        : `color: var(--wp-muted);`,
                 });
                 tab.addEventListener('click', () => {
                     state.tab = key;
@@ -2828,10 +3048,10 @@ export default function activate(folium) {
                 return;
             }
             const box = el('div', {
-                style: `border: 1px solid ${mix(colors.text, -0.72)}; background: ${mix(colors.text, -0.9)}; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;`,
+                style: `border: 1px solid var(--wp-border); background: var(--wp-surface-strong); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;`,
             });
             box.append(el('div', {
-                style: `font-size: 12px; font-weight: 600; color: ${colors.text};`,
+                style: `font-size: 12px; font-weight: 600; color: var(--wp-text);`,
                 text: '场景壁纸加载失败',
             }));
             box.append(el('div', {
@@ -2842,17 +3062,17 @@ export default function activate(folium) {
             const exportBtn = el('button', {
                 className: 'wp-eng-btn',
                 text: '导出错误日志',
-                style: `background: ${mix(colors.text, -0.78)}; color: ${colors.text};`,
+                style: `background: var(--wp-surface); color: var(--wp-text);`,
             });
             const issueBtn = el('button', {
                 className: 'wp-eng-btn',
                 text: '提交 Issue',
-                style: `background: transparent; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.72)};`,
+                style: `background: transparent; color: var(--wp-text); border: 1px solid var(--wp-border);`,
             });
             const dismiss = el('button', {
                 className: 'wp-eng-btn',
                 text: '收起',
-                style: `background: transparent; color: ${colors.muted};`,
+                style: `background: transparent; color: var(--wp-muted);`,
             });
             exportBtn.addEventListener('click', () => {
                 state.message = downloadErrorLog(report) ? '日志已导出到下载文件夹' : '导出失败';
@@ -2879,13 +3099,13 @@ export default function activate(folium) {
                 ['we', '壁纸引擎库'],
                 ['custom', '我的文件'],
             ];
-            const sourceSeg = el('div', { className: 'wp-eng-seg', style: `background: ${mix(colors.text, -0.88)};` });
+            const sourceSeg = el('div', { className: 'wp-eng-seg', style: `background: var(--wp-surface-strong);` });
             sources.forEach(([value, text]) => {
                 const button = el('button', {
                     text,
                     style: (settings.library ?? 'we') === value
-                        ? `background: ${mix(colors.text, -0.72)}; color: ${colors.text};`
-                        : `color: ${colors.muted};`,
+                        ? `background: var(--wp-surface); color: var(--wp-text);`
+                        : `color: var(--wp-muted);`,
                 });
                 button.addEventListener('click', () => {
                     panelContext.settings.set({ library: value });
@@ -2907,13 +3127,13 @@ export default function activate(folium) {
                 ['fixed', '指定'],
                 ['desktop', '跟随桌面'],
             ];
-            const segmented = el('div', { className: 'wp-eng-seg', style: `background: ${mix(colors.text, -0.88)};` });
+            const segmented = el('div', { className: 'wp-eng-seg', style: `background: var(--wp-surface-strong);` });
             modes.forEach(([value, text]) => {
                 const button = el('button', {
                     text,
                     style: value === settings.mode
-                        ? `background: ${mix(colors.text, -0.72)}; color: ${colors.text};`
-                        : `color: ${colors.muted};`,
+                        ? `background: var(--wp-surface); color: var(--wp-text);`
+                        : `color: var(--wp-muted);`,
                 });
                 button.addEventListener('click', () => {
                     panelContext.settings.set({ mode: value });
@@ -2944,7 +3164,7 @@ export default function activate(folium) {
             const reshuffleRow = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
             reshuffleRow.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: '重新抽取时机' }));
             const select = el('select', {
-                style: `background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.78)}; border-radius: 8px; padding: 5px 8px; font-size: 11.5px;`,
+                style: `background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border); border-radius: 8px; padding: 5px 8px; font-size: 11.5px;`,
             });
             [['song', '每次切歌'], ['hour', '每小时'], ['session', '每次启动']].forEach(([value, text]) => {
                 const option = el('option', { text, attrs: { value } });
@@ -2964,7 +3184,7 @@ export default function activate(folium) {
             seedRow.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: '随机种子' }));
             const seed = el('input', {
                 attrs: { type: 'number', min: '0', step: '1' },
-                style: `width: 112px; background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.78)}; border-radius: 8px; padding: 5px 8px; font-size: 11.5px; text-align: right;`,
+                style: `width: 112px; background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border); border-radius: 8px; padding: 5px 8px; font-size: 11.5px; text-align: right;`,
             });
             seed.value = String(settings.seed ?? 0);
             seed.addEventListener('change', () => {
@@ -3003,7 +3223,7 @@ export default function activate(folium) {
 
             const search = el('input', {
                 attrs: { type: 'search', placeholder: '搜索壁纸名…' },
-                style: `width: 100%; background: ${mix(colors.text, -0.88)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.8)}; border-radius: 8px; padding: 6px 9px; font-size: 11.5px;`,
+                style: `width: 100%; background: var(--wp-surface-strong); color: var(--wp-text); border: 1px solid var(--wp-border); border-radius: 8px; padding: 6px 9px; font-size: 11.5px;`,
             });
             search.value = state.query;
             search.addEventListener('input', () => {
@@ -3078,12 +3298,12 @@ export default function activate(folium) {
             const addImage = el('button', {
                 className: 'wp-eng-btn',
                 text: '添加图片',
-                style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
+                style: `background: var(--wp-surface); color: var(--wp-text);`,
             });
             const addVideo = el('button', {
                 className: 'wp-eng-btn',
                 text: '添加视频',
-                style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
+                style: `background: var(--wp-surface); color: var(--wp-text);`,
             });
             const busy = () => state.busy;
             addImage.addEventListener('click', () => pickCustom('image'));
@@ -3091,7 +3311,7 @@ export default function activate(folium) {
             const addOther = el('button', {
                 className: 'wp-eng-btn',
                 text: '其他格式',
-                style: `background: transparent; color: ${colors.muted}; border: 1px solid ${mix(colors.text, -0.78)};`,
+                style: `background: transparent; color: var(--wp-muted); border: 1px solid var(--wp-border);`,
                 attrs: { title: 'bmp / svg / ico 等对话框里没有列出的扩展名' },
             });
             addOther.addEventListener('click', () => pickCustom('any'));
@@ -3207,7 +3427,7 @@ export default function activate(folium) {
                     row.append(readout);
                     const range = el('input', {
                         attrs: { type: 'range', min: String(field.min ?? 0), max: String(field.max ?? 1), step: String(field.step ?? 0.01) },
-                        style: `accent-color: ${colors.accent};`,
+                        style: `accent-color: var(--wp-accent);`,
                     });
                     range.value = String(value);
                     range.addEventListener('input', () => {
@@ -3236,7 +3456,7 @@ export default function activate(folium) {
                     const row = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
                     row.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: i18nText(field.label, field.key) }));
                     const select = el('select', {
-                        style: `background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.78)}; border-radius: 8px; padding: 5px 8px; font-size: 11.5px;`,
+                        style: `background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border); border-radius: 8px; padding: 5px 8px; font-size: 11.5px;`,
                     });
                     (field.options ?? []).forEach((option) => {
                         const node = el('option', { text: i18nText(option.label, option.value) });
@@ -3257,23 +3477,197 @@ export default function activate(folium) {
             const reset = el('button', {
                 className: 'wp-eng-btn',
                 text: '恢复默认显示设置',
-                style: `align-self: flex-start; background: ${mix(colors.text, -0.86)}; color: ${colors.muted}; border: 1px solid ${mix(colors.text, -0.8)};`,
+                style: `align-self: flex-start; background: var(--wp-surface); color: var(--wp-muted); border: 1px solid var(--wp-border);`,
             });
             reset.addEventListener('click', () => {
                 panelContext.settings.reset();
                 paint();
             });
+
             box.append(reset);
             root.append(box);
+
+            // 壁纸属性（只有 scene 壁纸有 general.properties）
+            const propsBox = el('div', { style: 'display: flex; flex-direction: column; gap: 8px; margin-top: 6px;' });
+            propsBox.append(el('div', { style: 'font-size: 12px; font-weight: 600;', text: '壁纸属性' }));
+            const propsBody = el('div', { className: 'wp-eng-props', style: 'display: flex; flex-direction: column; gap: 8px;' });
+            propsBox.append(propsBody);
+            root.append(propsBox);
+            void renderWallpaperProps(propsBody, colors, settings);
+        };
+
+        /*
+         * 壁纸属性面板：读 project.json 的 general.properties（由主进程随壁纸库返回），
+         * 按属性类型生成控件；改动按壁纸 id 存进 storage 的 userProps，场景重挂时下发。
+         */
+        const weColorToHex = (value) => {
+            const parts = typeof value === 'string' ? value.trim().split(/\s+/).map(Number) : [];
+            if (parts.length < 3 || parts.some((n) => !Number.isFinite(n))) {
+                return '#ffffff';
+            }
+            const byte = (n) => Math.round(Math.max(0, Math.min(1, n)) * 255).toString(16).padStart(2, '0');
+            return `#${byte(parts[0])}${byte(parts[1])}${byte(parts[2])}`;
+        };
+
+        const hexToWeColor = (hex) => {
+            const match = /^#?([0-9a-f]{6})$/i.exec(String(hex ?? ''));
+            if (!match) {
+                return '1 1 1';
+            }
+            const n = parseInt(match[1], 16);
+            return [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+                .map((v) => (v / 255).toFixed(5))
+                .join(' ');
+        };
+
+        const cleanPropText = (raw) => String(raw ?? '')
+            .replace(/[\u0000-\u001f\u200b-\u200f\ufeff]/gi, '')
+            .trim();
+
+        // 属性文案：优先用 text；没有或和 key 相同就退回 name；都没有才用序号
+        const propLabel = (prop, index) => {
+            const text = cleanPropText(prop.text);
+            const name = cleanPropText(prop.name);
+            if (text && text !== name) {
+                return text;
+            }
+            if (name) {
+                return name;
+            }
+            return '属性 ' + (index + 1);
+        };
+
+        const renderWallpaperProps = async (hostEl, colors, settings) => {
+            hostEl.replaceChildren();
+            const hint = (text) => hostEl.append(el('div', { className: 'wp-eng-empty', text }));
+            let library = libraryCache;
+            if (!library || !Array.isArray(library.items)) {
+                try {
+                    library = await loadLibrary(false);
+                } catch {
+                    hint('没读到壁纸库；先打开壁纸列表再回来调属性。');
+                    return;
+                }
+            }
+            const items = Array.isArray(library?.items) ? library.items : [];
+            const selection = readSelection();
+            // 优先用「正在显示的那张」：随机/跟随桌面模式下也能实时调当前壁纸
+            const targetId = activeWallpaperId || selection.wallpaperId;
+            const item = items.find((entry) => entry.id === targetId)
+                ?? (settings.mode === 'desktop'
+                    ? items.find((entry) => entry.kind === 'scene' && entry.properties?.length)
+                    : null);
+            if (!item) {
+                hint('正在播放随机壁纸时，这里会显示当前壁纸的属性；也可以切到「指定壁纸」手动选一张。');
+                return;
+            }
+            if (item.kind !== 'scene' || !Array.isArray(item.properties) || item.properties.length === 0) {
+                hint('这张壁纸没有用户可调的属性。');
+                return;
+            }
+            const stored = await readUserProps();
+            const current = { ...(stored[item.id] || {}) };
+            const save = (name, value) => {
+                void writeUserProps(item.id, { [name]: value });
+            };
+            // 按 WE 的 order 排，面板顺序和作者在 WE 编辑器里看到的一致
+            const properties = [...(item.properties ?? [])]
+                .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+            properties.forEach((prop, index) => {
+                const value = Object.prototype.hasOwnProperty.call(current, prop.name) ? current[prop.name] : prop.value;
+                const row = el('div', { className: 'wp-eng-field' });
+                const labelText = propLabel(prop, index);
+                const label = el('label', { text: labelText });
+                // 正常文本完整换行；超长名字（照片名那类乱码）截断，悬停看全文
+                if (labelText.length > 56) {
+                    label.textContent = `${labelText.slice(0, 54)}…`;
+                    label.title = labelText;
+                }
+                label.style.cssText = 'white-space: normal; word-break: break-word; line-height: 1.4;';
+                row.append(label);
+                if (prop.type === 'color') {
+                    const input = el('input', { attrs: { type: 'color' } });
+                    input.value = weColorToHex(value);
+                    input.addEventListener('change', () => save(prop.name, hexToWeColor(input.value)));
+                    row.append(input);
+                } else if (prop.type === 'slider') {
+                    const wrap = el('div', { style: 'display: flex; flex-direction: column; gap: 2px; width: 100%;' });
+                    const range = el('input', { attrs: { type: 'range' } });
+                    range.min = String(prop.min ?? 0);
+                    range.max = String(prop.max ?? 1);
+                    range.step = String(prop.step ?? 0.01);
+                    range.value = String(Number(value) || 0);
+                    const readout = el('span', { className: 'wp-eng-value', text: String(Number(value) || 0) });
+                    range.addEventListener('input', () => {
+                        readout.textContent = range.value;
+                    });
+                    range.addEventListener('change', () => save(prop.name, Number(range.value)));
+                    wrap.append(range, readout);
+                    row.append(wrap);
+                } else if (prop.type === 'bool') {
+                    const input = el('input', { attrs: { type: 'checkbox' } });
+                    input.checked = value === true;
+                    input.addEventListener('change', () => save(prop.name, input.checked));
+                    row.append(input);
+                } else if (prop.type === 'combo' && Array.isArray(prop.options)) {
+                    const select = el('select', {});
+                    prop.options.forEach((option) => {
+                        const optionText = cleanPropText(option.label ?? option.value);
+                        const node = el('option', { text: optionText });
+                        node.title = optionText;
+                        node.value = String(option.value);
+                        if (String(value) === String(option.value)) {
+                            node.selected = true;
+                        }
+                        select.append(node);
+                    });
+                    // 存回原始类型：WE 的 combo 值可能是数字/布尔，转成字符串引擎不认
+                    select.addEventListener('change', () => {
+                        const option = prop.options[select.selectedIndex];
+                        save(prop.name, option ? option.value : select.value);
+                    });
+                    row.append(select);
+                } else if (prop.type === 'text' || prop.type === 'textinput') {
+                    const input = el('input', { attrs: { type: 'text' } });
+                    input.value = typeof value === 'string' ? value : '';
+                    input.addEventListener('change', () => save(prop.name, input.value));
+                    row.append(input);
+                } else {
+                    return;
+                }
+                hostEl.append(row);
+            });
+            const reset = el('button', {
+                className: 'wp-eng-btn',
+                text: '恢复这张壁纸的默认属性',
+                style: 'align-self: flex-start; background: var(--wp-surface); color: var(--wp-text); border: 1px solid var(--wp-border);',
+            });
+            reset.addEventListener('click', () => {
+                void (async () => {
+                    /*
+                     * 不能只删存储：运行中的场景收到空对象不会回落到项目默认值，
+                     * 会一直停在最后一次改过的状态。把 properties 里的默认 value 显式推一遍。
+                     */
+                    const defaults = {};
+                    for (const prop of item.properties ?? []) {
+                        if (prop && typeof prop.name === 'string' && 'value' in prop) {
+                            defaults[prop.name] = prop.value;
+                        }
+                    }
+                    await writeUserProps(item.id, Object.keys(defaults).length ? defaults : null);
+                    await renderWallpaperProps(hostEl, colors, settings);
+                })();
+            });
+            hostEl.append(reset);
         };
 
         const toggle = (colors, on, onChange) => {
             const button = el('button', {
                 attrs: { type: 'button', role: 'switch' },
-                style: `width: 40px; height: 22px; border-radius: 999px; border: 1px solid ${mix(colors.text, -0.75)}; background: ${on ? colors.accent : mix(colors.text, -0.86)}; position: relative; cursor: pointer; transition: background 160ms ease;`,
+                style: `width: 40px; height: 22px; border-radius: 999px; border: 1px solid var(--wp-border); background: ${on ? 'var(--wp-accent)' : 'var(--wp-surface)'}; position: relative; cursor: pointer; transition: background 160ms ease;`,
             });
             const knob = el('span', {
-                style: `position: absolute; top: 2px; left: ${on ? '20px' : '2px'}; width: 16px; height: 16px; border-radius: 50%; background: ${on ? mix(colors.surface, 0) : mix(colors.text, -0.55)}; transition: left 160ms ease;`,
+                style: `position: absolute; top: 2px; left: ${on ? '20px' : '2px'}; width: 16px; height: 16px; border-radius: 50%; background: ${on ? '#ffffff' : 'var(--wp-muted)'}; transition: left 160ms ease;`,
             });
             button.append(knob);
             button.addEventListener('click', () => onChange(!on));
@@ -3341,6 +3735,16 @@ export default function activate(folium) {
     try {
         folium.rpc.on('ready', () => {
             libraryCache = null;
+        });
+    } catch {
+        /* 非主窗口上下文没有 rpc.on */
+    }
+
+    // 属性面板和背景可能不在同一个窗口（壁纸模式）：收到广播就刷新面板；
+    // 场景属性由 mount 里的轮询直接推给运行中的场景，不再重挂
+    try {
+        folium.rpc.on('propsChanged', () => {
+            notify();
         });
     } catch {
         /* 非主窗口上下文没有 rpc.on */

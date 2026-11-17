@@ -215,6 +215,78 @@ const readCurrentDesktopWallpaper = async (engineDir) => {
  * scene 壁纸的内容封在 scene.pkg 里，必须 Wallpaper Engine 自己的运行时
  * 才解得开，第三方无法还原 —— 那就老实显示预览图，并在面板里标注。
  */
+/*
+ * WE 壁纸用户属性（`project.json` 的 `general.properties`）→ 面板可用的描述列表。
+ * 语义参照上游 we-props：order 按浮点读、combo 选项保留原始 JSON 类型、
+ * condition 只影响面板显隐不下发过滤；`editable: false` 是作者标记的用户不可编辑，
+ * 这里直接跳过（与 DSH 壁纸插件的裁剪版一致）。
+ */
+/* 属性文案里带 HTML 标签（<big>、<br> 等）是 WE 的常态，面板上要去掉 */
+const stripHtml = (raw) => {
+    if (typeof raw !== 'string' || raw === '') {
+        return '';
+    }
+    return raw
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0?39;|&apos;/gi, "'")
+        .replace(/[ \t]+\n/g, '\n')
+        .trim();
+};
+
+const parseWeProps = (project) => {
+    const props = project && project.general && project.general.properties;
+    if (!props || typeof props !== 'object') {
+        return [];
+    }
+    const out = [];
+    for (const [name, def] of Object.entries(props)) {
+        if (!def || typeof def !== 'object' || typeof def.type !== 'string') {
+            continue;
+        }
+        if (def.editable === false) {
+            continue;
+        }
+        const entry = {
+            name,
+            type: def.type,
+            text: typeof def.text === 'string' && def.text.trim() !== '' ? stripHtml(def.text) : name,
+            order: Number.isFinite(Number(def.order)) ? Number(def.order) : 0,
+        };
+        if ('value' in def) {
+            entry.value = def.value;
+        }
+        if (Array.isArray(def.options)) {
+            const options = def.options
+                .filter((option) => option && typeof option === 'object' && 'value' in option)
+                .map((option) => ({
+                    label: typeof option.label === 'string' ? stripHtml(option.label) : String(option.value),
+                    value: option.value,
+                }));
+            if (options.length) {
+                entry.options = options;
+            }
+        }
+        if (Number.isFinite(Number(def.min))) {
+            entry.min = Number(def.min);
+        }
+        if (Number.isFinite(Number(def.max))) {
+            entry.max = Number(def.max);
+        }
+        if (Number.isFinite(Number(def.step))) {
+            entry.step = Number(def.step);
+        }
+        out.push(entry);
+    }
+    out.sort((a, b) => a.order - b.order || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return out;
+};
+
 const readWallpaper = async (dir, source, idPrefix) => {
     const project = await readJson(path.join(dir, 'project.json'));
     if (!project || typeof project !== 'object') {
@@ -265,6 +337,8 @@ const readWallpaper = async (dir, source, idPrefix) => {
         absFile: hasFile ? fileAbs : null,
         absPreview: hasPreview ? previewAbs : null,
         tags: Array.isArray(project.tags) ? project.tags.filter((tag) => typeof tag === 'string').slice(0, 6) : [],
+        // 场景壁纸的用户属性定义；video / web 基本没有，返回空数组
+        properties: parseWeProps(project),
     };
 };
 
@@ -399,6 +473,267 @@ const sceneArtFor = async (item) => {
         }
     }
     return art;
+};
+
+// ---------------------------------------------------------------------------
+// 壁纸取色：给「壁纸取色主题」用
+// ---------------------------------------------------------------------------
+
+/*
+ * 用 Chromium 自带的解码器（nativeImage）取主色，而不是渲染端 canvas：
+ * 播放页是 file:// 或 app://，壁纸却从临时 HTTP 端口来，canvas 画跨域图会被污染。
+ * nativeImage 在主进程直接解 PNG/JPEG/WebP，缩到 40px 后统计颜色桶即可。
+ */
+let nativeImageRef = null;
+const nativeImageOf = () => {
+    if (nativeImageRef !== null) {
+        return nativeImageRef;
+    }
+    try {
+        const electron = require('electron');
+        nativeImageRef = electron && electron.nativeImage ? electron.nativeImage : false;
+    } catch {
+        nativeImageRef = false;
+    }
+    return nativeImageRef;
+};
+
+const paletteCache = new Map();
+const PALETTE_CACHE_ENTRIES = 300;
+
+const paletteCachePut = (key, value) => {
+    paletteCache.delete(key);
+    paletteCache.set(key, value);
+    while (paletteCache.size > PALETTE_CACHE_ENTRIES) {
+        paletteCache.delete(paletteCache.keys().next().value);
+    }
+};
+
+const rgbToHsl = ([r, g, b]) => {
+    const rn = r / 255;
+    const gn = g / 255;
+    const bn = b / 255;
+    const max = Math.max(rn, gn, bn);
+    const min = Math.min(rn, gn, bn);
+    const l = (max + min) / 2;
+    if (max === min) {
+        return [0, 0, Math.round(l * 100)];
+    }
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h;
+    if (max === rn) {
+        h = (gn - bn) / d + (gn < bn ? 6 : 0);
+    } else if (max === gn) {
+        h = (bn - rn) / d + 2;
+    } else {
+        h = (rn - gn) / d + 4;
+    }
+    return [Math.round(h * 60) % 360 || 0, Math.round(s * 100), Math.round(l * 100)];
+};
+
+// 颜色桶统计：BGRA / RGB 两种字节序共用
+const analyzeRgb = (bytes, bgro) => {
+    const buckets = new Map();
+    for (let index = 0; index + 2 < bytes.length; index += 3) {
+        const r = bgro ? bytes[index + 2] : bytes[index];
+        const g = bytes[index + 1];
+        const b = bgro ? bytes[index] : bytes[index + 2];
+        const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+        if (lum < 0.035 || lum > 0.96) {
+            continue;
+        }
+        const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        const entry = buckets.get(key) ?? { count: 0, r: 0, g: 0, b: 0 };
+        entry.count += 1;
+        entry.r += r;
+        entry.g += g;
+        entry.b += b;
+        buckets.set(key, entry);
+    }
+    if (buckets.size === 0) {
+        return null;
+    }
+    const entries = [...buckets.values()].sort((a, b) => b.count - a.count);
+    const pick = (entry) => ({
+        r: Math.round(entry.r / entry.count),
+        g: Math.round(entry.g / entry.count),
+        b: Math.round(entry.b / entry.count),
+    });
+    const samples = entries.slice(0, 6).map(pick);
+    let primary = samples[0];
+    let bestScore = -1;
+    for (const color of samples) {
+        const [, s, l] = rgbToHsl([color.r, color.g, color.b]);
+        const score = s * 1.6 + (1 - Math.abs(l - 50) / 50) * 10;
+        if (score > bestScore) {
+            bestScore = score;
+            primary = color;
+        }
+    }
+    const secondary = samples.find((color) => color !== primary) ?? primary;
+    return { primary, secondary };
+};
+
+// 取色主力：Electron nativeImage。取不到时返回 null，交给 ffmpeg 兜底。
+const paletteViaNativeImage = (buffer) => {
+    const nativeImage = nativeImageOf();
+    if (!nativeImage || !buffer || buffer.length === 0) {
+        return null;
+    }
+    let image;
+    try {
+        image = nativeImage.createFromBuffer(buffer);
+    } catch {
+        return null;
+    }
+    if (!image || image.isEmpty()) {
+        return null;
+    }
+    let small;
+    try {
+        small = image.resize({ width: 40, height: 40, quality: 'good' });
+    } catch {
+        small = image;
+    }
+    let bitmap;
+    try {
+        bitmap = small.toBitmap();
+    } catch {
+        return null;
+    }
+    if (!bitmap || bitmap.length < 16) {
+        return null;
+    }
+    const bgra = process.platform !== 'darwin';
+    const palette = analyzeRgb(bitmap.subarray(0, bitmap.length - (bitmap.length % 4)), bgra);
+    return palette;
+};
+
+const ffmpegCandidates = () => {
+    const found = [];
+    const env = process.env.FOLIA_FFMPEG_PATH;
+    if (env && fs.existsSync(env)) {
+        found.push(env);
+    }
+    const resources = process.resourcesPath;
+    if (resources) {
+        for (const name of ['ffmpeg', 'ffmpeg-8.1.2', 'ffmpeg-8.1.2-win64-static']) {
+            const candidate = path.join(resources, name, 'ffmpeg.exe');
+            try {
+                if (fs.existsSync(candidate)) {
+                    found.push(candidate);
+                }
+            } catch {
+                /* 忽略 */
+            }
+        }
+    }
+    found.push('ffmpeg');
+    return found;
+};
+
+// 兜底：让 ffmpeg 把图缩成 40x40 的 rgb24 原始帧，再走同一套颜色桶
+const paletteViaFfmpeg = (filePath) => new Promise((resolve) => {
+    const candidates = ffmpegCandidates();
+    const need = 40 * 40 * 3;
+    const tryNext = (index) => {
+        if (index >= candidates.length) {
+            resolve(null);
+            return;
+        }
+        const args = [
+            '-v', 'error',
+            '-i', filePath,
+            '-vf', 'scale=40:40',
+            '-frames:v', '1',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-',
+        ];
+        execFile(candidates[index], args, { timeout: 10000, maxBuffer: need + 1024, windowsHide: true }, (error, stdout) => {
+            if (error || !stdout || stdout.length < need) {
+                tryNext(index + 1);
+                return;
+            }
+            resolve(analyzeRgb(stdout.subarray(0, need), false));
+        });
+    };
+    tryNext(0);
+});
+
+const paletteSourcePaths = (item) => {
+    // 视频也收进来：ffmpeg 能直接抽帧，比「没有预览图就取不了色」稳
+    const mediaExt = /\.(png|jpe?g|webp|bmp|gif|mp4|m4v|webm|mov|mkv)$/i;
+    const paths = [];
+    if (item.absFile && mediaExt.test(item.absFile)) {
+        paths.push(item.absFile);
+    }
+    if (item.absPreview && mediaExt.test(item.absPreview)) {
+        paths.push(item.absPreview);
+    }
+    return paths;
+};
+
+const paletteFor = async (item) => {
+    const cached = paletteCache.get(item.id);
+    if (cached) {
+        return cached;
+    }
+    const paths = paletteSourcePaths(item);
+    const imageExt = /\.(png|jpe?g|webp|bmp|gif)$/i;
+    let palette = null;
+    // 1) nativeImage 解码原图 → 预览图 → 场景原画（只喂图片，视频交给 ffmpeg）
+    if (nativeImageOf()) {
+        const sources = [];
+        const imagePaths = paths.filter((filePath) => imageExt.test(filePath));
+        if (imagePaths[0]) {
+            sources.push({ path: imagePaths[0] });
+        }
+        if (item.kind === 'scene') {
+            try {
+                const art = await sceneArtFor(item);
+                if (art && art.body) {
+                    sources.push({ buffer: art.body });
+                }
+            } catch {
+                /* 忽略 */
+            }
+        }
+        if (imagePaths[1]) {
+            sources.push({ path: imagePaths[1] });
+        }
+        for (const source of sources) {
+            try {
+                const buffer = source.buffer ?? await fs.promises.readFile(source.path);
+                palette = paletteViaNativeImage(buffer);
+            } catch {
+                palette = null;
+            }
+            if (palette) {
+                break;
+            }
+        }
+    }
+    // 2) ffmpeg 兜底（图片、视频都能抽一帧）
+    if (!palette) {
+        for (const filePath of paths) {
+            palette = await paletteViaFfmpeg(filePath);
+            if (palette) {
+                break;
+            }
+        }
+    }
+    if (!palette) {
+        return null;
+    }
+    const result = {
+        ...palette,
+        primaryHsl: rgbToHsl([palette.primary.r, palette.primary.g, palette.primary.b]),
+        secondaryHsl: rgbToHsl([palette.secondary.r, palette.secondary.g, palette.secondary.b]),
+    };
+    paletteCachePut(item.id, result);
+    return result;
 };
 
 /**
@@ -802,27 +1137,52 @@ const SCENE_HOST = `<!doctype html><html><head><meta charset="utf-8">
             post('error', { message: 'engine not loaded' });
             return;
         }
-        instance = WebWallGL.createScene(document.body, {
-            fit: params.get('fit') === 'contain' ? 'contain' : params.get('fit') === 'fill' ? 'stretch' : 'cover',
-            fps: Math.max(15, Math.min(60, Number(params.get('fps')) || 30)),
-            volume: 0,
-            autoplay: true,
-            scripts: true,
-            onDiagnostic: function (message, level) {
-                post('diag', { level: level, message: String(message) });
-                if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
-                    setTimeout(sendReady, 800);
-                }
-            },
-            onError: function (error) {
-                post('error', { message: String(error && error.message || error) });
+        var boot = function (props) {
+            try {
+                instance = WebWallGL.createScene(document.body, {
+                    fit: params.get('fit') === 'contain' ? 'contain' : params.get('fit') === 'fill' ? 'stretch' : 'cover',
+                    fps: Math.max(15, Math.min(60, Number(params.get('fps')) || 30)),
+                    volume: 0,
+                    autoplay: true,
+                    scripts: true,
+                    // 引擎的 __applyOptions 认的是 properties（scriptProperties 只是脚本侧全局名）
+                    properties: props || {},
+                    onDiagnostic: function (message, level) {
+                        post('diag', { level: level, message: String(message) });
+                        if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
+                            setTimeout(sendReady, 800);
+                        }
+                    },
+                    onError: function (error) {
+                        post('error', { message: String(error && error.message || error) });
+                    }
+                });
+            } catch (error) {
+                post('error', { message: 'create: ' + String(error && error.message || error) });
+                return;
             }
-        });
-        instance.setAudio({ snapshot: function () { return { left: left, right: right }; } });
-        instance.load(WebWallGL.httpSource('pkg')).then(function () {
-            sendReady();
-        }, function (error) {
-            post('error', { message: 'load: ' + String(error && error.message || error) });
+            instance.setAudio({ snapshot: function () { return { left: left, right: right }; } });
+            instance.load(WebWallGL.httpSource('pkg')).then(function () {
+                sendReady();
+                if (props && Object.keys(props).length) {
+                    try {
+                        instance.setProperties(props);
+                    } catch (error) {
+                        post('diag', { level: 'warn', message: 'props: ' + String(error && error.message || error) });
+                    }
+                }
+            }, function (error) {
+                post('error', { message: 'load: ' + String(error && error.message || error) });
+            });
+        };
+        // 先取用户属性再建场景：没有 applyUserProperties 钩子的场景在初始化时也能吃到值
+        fetch('props', { cache: 'no-store' }).then(function (response) {
+            return response.ok ? response.json() : {};
+        }).then(function (props) {
+            boot(props && typeof props === 'object' ? props : {});
+        }).catch(function (error) {
+            post('diag', { level: 'warn', message: 'props fetch failed: ' + String(error && error.message || error) });
+            boot({});
         });
     } catch (error) {
         post('error', { message: 'create: ' + String(error && error.message || error) });
@@ -834,6 +1194,15 @@ const SCENE_HOST = `<!doctype html><html><head><meta charset="utf-8">
         if (data.type === 'audio' && data.left && data.right) {
             left.set(data.left);
             right.set(data.right);
+            return;
+        }
+        if (data.type === 'props' && data.props && instance) {
+            // 运行中调属性：不重建 iframe，直接把新属性喂给引擎（重挂会黑一下）
+            try {
+                instance.setProperties(data.props);
+            } catch (error) {
+                post('diag', { level: 'warn', message: 'props: ' + String(error && error.message || error) });
+            }
             return;
         }
         if (data.type === 'media') {
@@ -935,6 +1304,8 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
     const token = crypto.randomBytes(16).toString('hex');
     const tokenPrefix = `/${token}`;
     const root = item.dir;
+    // 当前壁纸的用户属性值：渲染端每次 sceneFrame 时更新，host.html 自己来取
+    let currentProps = {};
     const enginePath = path.join(__dirname, 'vendor', 'webwallgl.global.min.js');
     const server = http.createServer(async (request, response) => {
         try {
@@ -950,6 +1321,16 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
                 return;
             }
             url.pathname = url.pathname.slice(tokenPrefix.length) || '/';
+            if (url.pathname === '/props') {
+                const body = Buffer.from(JSON.stringify(currentProps ?? {}), 'utf8');
+                response.writeHead(200, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Content-Length': String(body.length),
+                    'Cache-Control': 'no-store',
+                });
+                response.end(request.method === 'HEAD' ? undefined : body);
+                return;
+            }
             if (url.pathname === '/host.html') {
                 const body = Buffer.from(SCENE_HOST, 'utf8');
                 response.writeHead(200, {
@@ -997,7 +1378,16 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
     server.listen(0, '127.0.0.1', () => {
         const address = server.address();
         const origin = `http://127.0.0.1:${address.port}`;
-        resolve({ server, token, origin, base: `${origin}/${token}`, dir: root });
+        resolve({
+            server,
+            token,
+            origin,
+            base: `${origin}/${token}`,
+            dir: root,
+            setProps: (value) => {
+                currentProps = value && typeof value === 'object' ? value : {};
+            },
+        });
     });
 });
 
@@ -1325,11 +1715,62 @@ module.exports = function activate(api) {
                 absFile: item.absFile,
                 absPreview: item.absPreview,
                 tags: item.tags,
+                // WE 用户属性定义（场景壁纸才有）
+                properties: item.properties,
             })),
         };
     };
 
     api.rpc.handle('library', (options) => payload(options && options.refresh === true));
+
+    /*
+     * 取某张壁纸的主色 / 辅色。渲染端拿到后自己换算成 CSS 变量注入。
+     * 结果按 item.id 缓存在主进程，换回同一张壁纸不用重新解码。
+     */
+    api.rpc.handle('themePalette', async (options) => {
+        const id = String(options?.id ?? '');
+        if (!id) {
+            return { ok: false, error: 'bad-id' };
+        }
+        const current = await ensureLibrary(false);
+        const item = current.items.find((entry) => entry.id === id);
+        if (!item) {
+            return { ok: false, error: 'not-found' };
+        }
+        try {
+            const palette = await paletteFor(item);
+            if (!palette) {
+                return { ok: false, error: 'no-image' };
+            }
+            return { ok: true, ...palette };
+        } catch (error) {
+            return { ok: false, error: String(error?.message ?? error) };
+        }
+    });
+
+    /*
+     * 主题写进 localStorage 后，Folia 运行中不会重新读；页面刷新还会被主题编辑器
+     * 用旧值覆盖回去。唯一可靠的方式是重启进程，这里给渲染端一个「重启 Folia」。
+     */
+    api.rpc.handle('relaunchApp', () => {
+        try {
+            const { app } = require('electron');
+            if (!app || typeof app.relaunch !== 'function') {
+                return { ok: false, error: 'no-electron-app' };
+            }
+            setTimeout(() => {
+                try {
+                    app.relaunch();
+                    app.exit(0);
+                } catch {
+                    /* 已经退出 */
+                }
+            }, 500);
+            return { ok: true };
+        } catch (error) {
+            return { ok: false, error: String(error?.message ?? error) };
+        }
+    });
 
     /*
      * 给网页壁纸拿一个属于自己的临时 origin。渲染端只用返回的 url 当 iframe.src，
@@ -1428,6 +1869,9 @@ module.exports = function activate(api) {
             }
         }
         host.refs += 1;
+        if (typeof host.setProps === 'function') {
+            host.setProps(options?.props && typeof options.props === 'object' ? options.props : {});
+        }
         const query = new URLSearchParams({
             fit: String(options?.fit ?? 'cover'),
             fps: String(Math.max(15, Math.min(60, Number(options?.fps) || 30))),
@@ -1484,6 +1928,19 @@ module.exports = function activate(api) {
     });
 
     api.rpc.handle('ping', () => ({ ok: true, base }));
+
+    /*
+     * 壁纸模式下背景在独立窗口渲染。属性面板保存后调用这里，由主进程广播给所有窗口，
+     * 让每个窗口里的背景都重挂一次、带上新的属性值。
+     */
+    api.rpc.handle('propsChanged', () => {
+        try {
+            api.rpc.send('propsChanged', {});
+        } catch (error) {
+            void error;
+        }
+        return { ok: true };
+    });
 
     startServer(() => library).then((started) => {
         server = started.server;
