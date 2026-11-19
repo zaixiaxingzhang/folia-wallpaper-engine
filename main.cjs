@@ -16,6 +16,7 @@ const fs = require('fs');
 const { execFile } = require('child_process');
 const path = require('path');
 const http = require('http');
+const { registeredSteamRoots, engineFiles, mediaItem, pathKey, createLocalFiles } = require('./local-files.cjs');
 
 // Wallpaper Engine 在 Steam 上的 AppID
 const WE_APP_ID = '431960';
@@ -119,7 +120,7 @@ const mapLimit = async (items, limit, worker) => {
  * 全部去重。只做 exists 检查，不递归、不遍历整个磁盘。
  */
 const findSteamRoots = async () => {
-    const candidates = [];
+    const candidates = await registeredSteamRoots();
     const programFiles = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, 'C:\\Program Files (x86)', 'C:\\Program Files'];
     programFiles.filter(Boolean).forEach((base) => {
         candidates.push(path.join(base, 'Steam'));
@@ -189,17 +190,8 @@ const readCurrentDesktopWallpaper = async (engineDir) => {
     if (!config || typeof config !== 'object') {
         return null;
     }
-    const accountKey = Object.keys(config).find((key) => /^\d+$/.test(key) && config[key] && typeof config[key] === 'object');
-    const general = accountKey ? config[accountKey].general : null;
-    const selected = general?.wallpaperconfig?.selectedwallpapers;
-    if (!selected || typeof selected !== 'object') {
-        return null;
-    }
-    const monitorKey = Object.keys(selected).find((key) => selected[key] && typeof selected[key].file === 'string');
-    if (!monitorKey) {
-        return null;
-    }
-    const file = selected[monitorKey].file;
+    const file = engineFiles(config).desktopFile;
+    if (!file) return null;
     const dir = path.dirname(file);
     return {
         file,
@@ -220,7 +212,9 @@ const readWallpaper = async (dir, source, idPrefix) => {
     if (!project || typeof project !== 'object') {
         return null;
     }
-    const kind = String(project.type || 'scene').trim().toLowerCase() || 'scene';
+    const inferred = /\.(mp4|m4v|webm|mov|mkv|avi|wmv|flv|ts)$/i.test(project.file || '') ? 'video'
+        : /\.html?$/i.test(project.file || '') ? 'web' : 'scene';
+    const kind = String(project.type || inferred).trim().toLowerCase() || inferred;
     const fileRel = typeof project.file === 'string' ? project.file : null;
     const previewRel = typeof project.preview === 'string' ? project.preview : null;
     const resolve = (rel) => {
@@ -247,7 +241,7 @@ const readWallpaper = async (dir, source, idPrefix) => {
             live = 'web';
         }
     }
-    if (!previewRel && !hasPreview && !live) {
+    if (!hasPreview && !live && !(kind === 'scene' && await isFile(path.join(dir, 'scene.pkg')))) {
         return null;
     }
 
@@ -274,59 +268,41 @@ const scanLibrary = async () => {
     const engineDirs = await findEngineDirs(roots);
     const items = [];
     const seen = new Set();
-
-    const addFrom = async (dir, source, idPrefix) => {
-        let names;
-        try {
-            names = await fs.promises.readdir(dir, { withFileTypes: true });
-        } catch {
-            return;
-        }
-        const dirs = names
-            .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-            .map((entry) => path.join(dir, entry.name));
-        const found = await mapLimit(dirs, 8, async (full) => ({ full, item: await readWallpaper(full, source, '') }));
-        found.forEach(({ full, item }) => {
-            if (!item) {
-                return;
-            }
-            // 同一个 workshop id 可能在多个库里重复，只留先找到的那个
-            const key = item.workshopId ? `w:${item.workshopId}` : `d:${full.toLowerCase()}`;
-            if (seen.has(key)) {
-                return;
-            }
-            seen.add(key);
-            item.id = idPrefix + path.basename(full);
-            item.dir = full;
-            items.push(item);
-        });
+    const add = (item) => {
+        if (!item) return;
+        const key = pathKey(item.absFile || path.join(item.dir, 'scene.pkg'));
+        if (seen.has(key)) return;
+        seen.add(key);
+        items.push(item);
     };
-
-    for (const dir of workshopDirs) {
-        await addFrom(dir, 'workshop', 'w-');
-    }
+    const addProject = async (dir, source, prefix) => {
+        try { dir = await fs.promises.realpath(dir); } catch { return; }
+        const item = await readWallpaper(dir, source, prefix);
+        if (item) add({ ...item, dir });
+    };
+    const addFrom = async (dir, source, prefix) => {
+        let names;
+        try { names = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+        const dirs = names.filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'));
+        await mapLimit(dirs, 8, (entry) => addProject(path.join(dir, entry.name), source, prefix));
+    };
+    for (const dir of workshopDirs) await addFrom(dir, 'workshop', 'w-');
+    let desktopFile = null;
     for (const engineDir of engineDirs) {
         await addFrom(path.join(engineDir, 'projects', 'myprojects'), 'local', 'l-');
+        await addFrom(path.join(engineDir, 'projects', 'defaultprojects'), 'builtin', 'd-');
+        const imported = engineFiles(await readJson(path.join(engineDir, 'config.json')));
+        desktopFile ||= imported.desktopFile;
+        await mapLimit(imported.files, 8, async (file) => {
+            const media = await mediaItem(file);
+            if (media) add(media);
+            else if (/\.(pkg|json|html?)$/i.test(file)) await addProject(path.dirname(file), 'local', 'l-');
+        });
     }
-
     items.sort((left, right) => left.title.localeCompare(right.title, 'zh-Hans-CN'));
-
-    const engineDir = engineDirs[0] ?? null;
-    const desktop = engineDir ? await readCurrentDesktopWallpaper(engineDir) : null;
-    let currentId = null;
-    if (desktop?.workshopId) {
-        const match = items.find((item) => item.workshopId === desktop.workshopId);
-        currentId = match ? match.id : null;
-    }
-
-    return {
-        items,
-        currentId,
-        engineDir,
-        workshopDirs,
-        roots,
-        desktopFile: desktop?.file ?? null,
-    };
+    const current = desktopFile ? items.find((item) => pathKey(item.absFile || path.join(item.dir, 'scene.pkg')) === pathKey(desktopFile)) : null;
+    return { items, currentId: current?.id ?? null, engineDir: engineDirs[0] ?? null,
+        workshopDirs, roots, desktopFile };
 };
 
 // ---------------------------------------------------------------------------
@@ -1009,7 +985,7 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
  *   GET /i/<id>/art              scene.pkg 里抽出来的原图（没有则 404）
  * 任何路径都会被限制在登记过的壁纸目录内。
  */
-const startServer = (getLibrary) => new Promise((resolve, reject) => {
+const startServer = (getLibrary, getCustomFiles = () => []) => new Promise((resolve, reject) => {
     /*
      * 随机路径前缀。没有它，本机任何网页都能扫端口读壁纸列表和文件；
      * 有了它，只有拿到 base 的渲染端（也就是模组自己）知道地址。
@@ -1054,6 +1030,13 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
             }
 
             const segments = url.pathname.split('/').filter(Boolean);
+            if (segments.length === 2 && segments[0] === 'f') {
+                const item = getCustomFiles().find((entry) => entry.id === segments[1]);
+                if (!item) { response.writeHead(404); response.end(); return; }
+                await serveFile(request, response, item.absFile, {}, tokenPrefix);
+                return;
+            }
+
 
             // 图层清单：渲染端据此用 canvas 叠回完整场景
             if (segments.length === 3 && segments[0] === 'i' && segments[2] === 'scene') {
@@ -1191,6 +1174,9 @@ const startServer = (getLibrary) => new Promise((resolve, reject) => {
                 response.end('Forbidden');
                 return;
             }
+            if (item.singleFile && pathKey(target) !== pathKey(item.absFile)) {
+                response.writeHead(404); response.end(); return;
+            }
             await serveFile(request, response, target, {}, tokenPrefix);
         } catch (error) {
             try {
@@ -1218,6 +1204,9 @@ module.exports = function activate(api) {
     let base = null;
     let server = null;
     let lastScannedAt = 0;
+    const localFiles = createLocalFiles(api);
+    let customItems = [];
+    const refreshCustom = async () => { customItems = await localFiles.items(); };
 
     // 网页壁纸的临时服务，按壁纸 id 复用；渲染端卸载时 release 掉
     const webHosts = new Map();
@@ -1330,6 +1319,32 @@ module.exports = function activate(api) {
     };
 
     api.rpc.handle('library', (options) => payload(options && options.refresh === true));
+    api.rpc.handle('customFiles', async () => {
+        await serviceReady;
+        if (!base) throw new Error('本地壁纸服务未启动');
+        await refreshCustom();
+        return { items: customItems.map((item) => ({ grantId: `local:${item.id}`,
+            name: path.basename(item.absFile), kind: item.kind, url: `${base}/f/${item.id}` })) };
+    });
+    api.rpc.handle('importLocalFiles', async (options) => {
+        const result = await localFiles.pick(options);
+        await refreshCustom();
+        return result;
+    });
+    api.rpc.handle('importWeFiles', async () => {
+        const current = await ensureLibrary(true);
+        const result = await localFiles.remember(current.items.filter((item) => item.source === 'we-local').map((item) => item.absFile));
+        await refreshCustom();
+        return result;
+    });
+    api.rpc.handle('removeLocalFile', async (options) => {
+        const id = String(options?.id || '');
+        if (!/^f-[a-f0-9]{24}$/.test(id)) throw new Error('无效的本地文件 id');
+        await localFiles.remove(id);
+        await refreshCustom();
+        return { ok: true };
+    });
+
 
     /*
      * 给网页壁纸拿一个属于自己的临时 origin。渲染端只用返回的 url 当 iframe.src，
@@ -1485,10 +1500,11 @@ module.exports = function activate(api) {
 
     api.rpc.handle('ping', () => ({ ok: true, base }));
 
-    startServer(() => library).then((started) => {
+    const serviceReady = startServer(() => library, () => customItems).then(async (started) => {
         server = started.server;
         base = started.base;
-        api.log.info(`壁纸服务已启动 ${base}`);
+        await refreshCustom();
+        api.log.info('壁纸服务已启动');
         // 后台先建好库，面板打开时不必等（扫描是异步的，不挡 ready）
         ensureLibrary(false).catch(() => {});
         api.rpc.send('ready', { base });
