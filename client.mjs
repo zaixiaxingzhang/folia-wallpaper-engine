@@ -1,3 +1,5 @@
+import { createWallpaperPicker, createWallpaperRotation, trackIdentity } from './rotation.mjs';
+
 // client.mjs — 渲染端：注册一个「壁纸引擎」背景类型。
 //
 // 它做三件事：
@@ -10,6 +12,7 @@
 
 export default function activate(folium) {
     const t = (zh, en) => ({ 'zh-CN': zh, en });
+    const sessionKey = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     // 壁纸选择状态跨 mount / 设置面板共享，改完立刻互相通知，不轮询。
     // 背景挂载与设置面板各用一组订阅：场景失败时只让面板刷新，
@@ -305,6 +308,8 @@ export default function activate(folium) {
             if (missing.length > 0) {
                 await writeCustomEntries(entries.filter((entry) => !missing.includes(entry)));
             }
+            const local = await folium.rpc.call('customFiles');
+            resolved.push(...(local?.items ?? []));
             customCache = resolved;
             return resolved;
         })().finally(() => {
@@ -322,26 +327,17 @@ export default function activate(folium) {
      */
     const classifyFile = (name) => (VIDEO_EXT.test(name) ? 'video' : IMAGE_EXT.test(name) ? 'image' : null);
 
-    const addCustomFile = async (kind) => {
-        const handle = await folium.ui.pickFile({ accept: kind, persist: true });
-        if (!handle || !handle.url || !handle.grantId) {
-            return null;
-        }
-        const resolvedKind = kind === 'any' ? classifyFile(handle.name ?? '') : kind;
-        if (!resolvedKind) {
-            try {
-                await folium.ui.releaseFile(handle.grantId);
-            } catch {
-                /* 授权已经不在，忽略 */
-            }
-            throw new Error(`认不出这个文件类型：${handle.name ?? ''}`);
-        }
-        const entries = await readCustomEntries();
-        await writeCustomEntries([...entries, { grantId: handle.grantId, name: handle.name, kind: resolvedKind }]);
-        return { ...handle, kind: resolvedKind };
-    };
+    const addCustomFile = async (kind) => kind === 'we'
+        ? folium.rpc.call('importWeFiles')
+        : folium.rpc.call('importLocalFiles', { kind, folder: kind === 'folder' });
 
     const removeCustomFile = async (grantId) => {
+        if (grantId.startsWith('local:')) {
+            await folium.rpc.call('removeLocalFile', { id: grantId.slice(6) });
+            customCache = null;
+            notify();
+            return;
+        }
         const entries = await readCustomEntries();
         await writeCustomEntries(entries.filter((entry) => entry.grantId !== grantId));
         try {
@@ -383,7 +379,7 @@ export default function activate(folium) {
         {
             key: 'mode', type: 'select', defaultValue: 'random',
             label: t('壁纸来源', 'Wallpaper source'),
-            description: t('伪随机会按种子和切歌计算，同一首歌每次都是同一张', 'Pseudo-random derives from the seed and the song, so a song always gets the same wallpaper'),
+            description: t('按种子和轮换时机选择壁纸，尽量避免连续重复', 'Choose by seed and rotation policy, avoiding immediate repeats where possible'),
             options: [
                 { value: 'random', label: t('伪随机', 'Pseudo-random') },
                 { value: 'fixed', label: t('指定壁纸', 'Fixed wallpaper') },
@@ -397,13 +393,37 @@ export default function activate(folium) {
         },
         {
             key: 'reshuffle', type: 'select', defaultValue: 'song',
-            label: t('重新抽取时机', 'Reshuffle on'),
+            label: t('壁纸轮换方式', 'Wallpaper rotation'),
             description: t('伪随机模式下什么时候换下一张', 'When pseudo-random mode picks the next wallpaper'),
             options: [
                 { value: 'song', label: t('每次切歌', 'Song change') },
+                { value: 'media', label: t('按媒体播放', 'Media playback') },
+                { value: 'interval', label: t('固定间隔', 'Fixed interval') },
                 { value: 'hour', label: t('每小时', 'Every hour') },
                 { value: 'session', label: t('每次启动', 'App launch') },
             ],
+        },
+        {
+            key: 'videoPlayCount', type: 'number', defaultValue: 1, min: 1, max: 1000, step: 1,
+            label: t('视频播放次数', 'Video plays before switching'),
+        },
+        {
+            key: 'intervalValue', type: 'number', defaultValue: 5, min: 0.1, max: 86400, step: 0.1,
+            label: t('轮换间隔', 'Rotation interval'),
+        },
+        {
+            key: 'intervalUnit', type: 'select', defaultValue: 'minutes',
+            label: t('间隔单位', 'Interval unit'),
+            options: [{ value: 'seconds', label: t('秒', 'Seconds') }, { value: 'minutes', label: t('分钟', 'Minutes') }],
+        },
+        {
+            key: 'imageDurationValue', type: 'number', defaultValue: 3, min: 0.1, max: 86400, step: 0.1,
+            label: t('图片等停留时间', 'Still wallpaper duration'),
+        },
+        {
+            key: 'imageDurationUnit', type: 'select', defaultValue: 'minutes',
+            label: t('停留时间单位', 'Duration unit'),
+            options: [{ value: 'seconds', label: t('秒', 'Seconds') }, { value: 'minutes', label: t('分钟', 'Minutes') }],
         },
         {
             key: 'liveOnly', type: 'boolean', defaultValue: true,
@@ -598,36 +618,34 @@ export default function activate(folium) {
         return hash >>> 0;
     };
 
-    const shuffleKey = (settings, context) => {
-        if (settings.reshuffle === 'hour') {
-            return `h${Math.floor(Date.now() / 3_600_000)}`;
-        }
-        if (settings.reshuffle === 'session') {
-            return 'session';
-        }
-        try {
-            return `s${context.getCoverUrl() ?? ''}`;
-        } catch {
-            return 'session';
-        }
+    const getTrackKey = (context) => {
+        let song = null;
+        try { song = folium.playback?.getState?.()?.song ?? null; } catch { /* Cover fallback for older hosts. */ }
+        return trackIdentity(song, context.getCoverUrl?.() ?? '');
+    };
+    const shuffleKey = (settings, context, epoch = 0) => {
+        if (settings.reshuffle === 'session') return `session:${sessionKey}`;
+        if (!settings.reshuffle || settings.reshuffle === 'song') return `song:${getTrackKey(context)}:${epoch}`;
+        return `${settings.reshuffle}:${sessionKey}:${epoch}`;
     };
 
     /*
      * 自定义文件走同一套选法：指定 / 伪随机 / 跟随桌面（后者没有桌面可跟，
      * 退回伪随机，面板里会写明）。自定义条目本来就少，抽中率是均匀的。
      */
-    const chooseCustom = (entries, settings, context, selection) => {
+    const chooseCustom = (entries, settings, context, selection, picker = null, epoch = 0) => {
         if (!Array.isArray(entries) || entries.length === 0) {
             return null;
         }
         if (settings.mode === 'fixed') {
             return entries.find((entry) => entry.grantId === selection.customId) ?? entries[0];
         }
+        if (picker) return picker.choose(entries, settings.seed, `custom:${shuffleKey(settings, context, epoch)}`, (entry) => entry.grantId);
         const index = fnv1a(`${settings.seed}|${shuffleKey(settings, context)}`) % entries.length;
         return entries[index];
     };
 
-    const chooseWallpaper = (library, settings, context, selection) => {
+    const chooseWallpaper = (library, settings, context, selection, picker = null, epoch = 0) => {
         if (!library || !Array.isArray(library.items) || library.items.length === 0) {
             return null;
         }
@@ -643,6 +661,7 @@ export default function activate(folium) {
         }
         const pool = settings.liveOnly ? all.filter((item) => item.live) : all;
         const usable = pool.length > 0 ? pool : all;
+        if (picker) return picker.choose(usable, settings.seed, `we:${shuffleKey(settings, context, epoch)}`);
         const index = fnv1a(`${settings.seed}|${shuffleKey(settings, context)}`) % usable.length;
         return usable[index];
     };
@@ -776,6 +795,27 @@ export default function activate(folium) {
         let disposed = false;
         let selection = {};
         let library = null;
+        let rotationEpoch = 0;
+        let stopRotationPoll = null;
+        let rotationBoundMedia = null;
+        const rotationPicker = createWallpaperPicker();
+        const rotation = createWallpaperRotation({ onAdvance: () => {
+            rotationEpoch += 1;
+            scheduleRender();
+        } });
+        const pollRotation = () => {
+            rotation.update({ settings: context.getSettings(), trackKey: getTrackKey(context),
+                paused: context.isPaused(), active: !isPreviewSurface() });
+            if (media && media !== rotationBoundMedia && !isPreviewSurface()) bindRotation();
+        };
+        const bindRotation = () => {
+            if (!currentKey || isPreviewSurface() || String(currentKey).startsWith('preview:')) return;
+            if (!stopRotationPoll) stopRotationPoll = context.every(200, pollRotation);
+            if (!media) return;
+            rotation.attach({ id: currentKey, kind: media.tagName === 'VIDEO' ? 'video' : 'image',
+                video: media.tagName === 'VIDEO' ? media : null, epoch: rotationEpoch });
+            rotationBoundMedia = media;
+        };
 
         const textLuminance = () => {
             let primary = '#ffffff';
@@ -967,6 +1007,7 @@ export default function activate(folium) {
 
         const applyFilters = () => {
             const settings = context.getSettings();
+            bindRotation();
             const blur = Math.max(0, Number(settings.blur) || 0);
             const saturation = Math.max(0, Number(settings.saturation) || 0);
             // 模糊会吃掉边缘，稍微放大一点盖住；推拉幅度由鼓点循环接管
@@ -1017,6 +1058,8 @@ export default function activate(folium) {
         };
 
         const teardownMedia = () => {
+            rotation.detach();
+            rotationBoundMedia = null;
             stopMotion();
             const layers = Array.from(mediaWrap.children ?? []);
             let hadLayer = false;
@@ -2234,6 +2277,7 @@ export default function activate(folium) {
                     const onReady = () => {
                         refreshReadability();
                         if (context.isPaused() && settings.syncPause) {
+                            video.pause();
                             return;
                         }
                         video.play().catch(() => undefined);
@@ -2314,6 +2358,7 @@ export default function activate(folium) {
                     poster = null;
                     refreshReadability();
                     if (context.isPaused() && settings.syncPause) {
+                        video.pause();
                         return;
                     }
                     video.play().catch(() => undefined);
@@ -2451,10 +2496,14 @@ export default function activate(folium) {
             }
             clearSceneError();
             clearSceneToast();
+            pollRotation();
             const settings = context.getSettings();
 
             // 选择器预览：不碰引擎，只铺一张静态图
             if (isPreviewSurface()) {
+                rotation.detach();
+                stopRotationPoll?.();
+                stopRotationPoll = null;
                 const previewSelection = await readState();
                 let previewItem;
                 if (settings.library === 'custom') {
@@ -2494,7 +2543,7 @@ export default function activate(folium) {
                     return;
                 }
                 library = null;
-                const choice = chooseCustom(entries, settings, context, selection);
+                const choice = chooseCustom(entries, settings, context, selection, rotationPicker, rotationEpoch);
                 if (!choice) {
                     teardownMedia();
                     currentKey = null;
@@ -2530,7 +2579,7 @@ export default function activate(folium) {
             if (disposed) {
                 return;
             }
-            const item = chooseWallpaper(library, settings, context, selection);
+            const item = chooseWallpaper(library, settings, context, selection, rotationPicker, rotationEpoch);
             if (!item) {
                 paintReadability(0.06);
                 info.textContent = library?.error ? '壁纸引擎：未找到壁纸库' : '壁纸引擎：没有可用壁纸';
@@ -2633,6 +2682,9 @@ export default function activate(folium) {
 
         return () => {
             disposed = true;
+            rotation.dispose();
+            stopRotationPoll?.();
+            stopRotationPoll = null;
             listeners.delete(onSelectionChange);
             if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
                 window.removeEventListener('pointermove', onPointerMove);
@@ -2766,7 +2818,7 @@ export default function activate(folium) {
             const head = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
             const title = el('div', {
                 style: 'font-size: 13px; font-weight: 600;',
-                text: `壁纸引擎 · ${libraryCache?.items?.length ?? 0} 张`,
+                text: (settings.library ?? 'we') === 'custom' ? `我的文件 · ${customCache?.length ?? 0} 项` : `壁纸引擎 · ${libraryCache?.items?.length ?? 0} 张`,
             });
             const tools = el('div', { className: 'wp-eng-row' });
             const refresh = el('button', {
@@ -2898,6 +2950,14 @@ export default function activate(folium) {
             paintErrorBanner(colors);
 
             if ((settings.library ?? 'we') === 'custom') {
+                const modes = el('div', { className: 'wp-eng-seg' });
+                [['random', '轮换'], ['fixed', '指定']].forEach(([value, text]) => {
+                    const button = el('button', { text, style: settings.mode === value ? `background: ${mix(colors.text, -0.72)}; color: ${colors.text};` : `color: ${colors.muted};` });
+                    button.addEventListener('click', () => { panelContext.settings.set({ mode: value }); paint(); });
+                    modes.append(button);
+                });
+                root.append(modes);
+                if (settings.mode === 'random') paintRandomControls(colors, settings);
                 paintCustomTab(colors, settings);
                 return;
             }
@@ -2942,11 +3002,11 @@ export default function activate(folium) {
             const box = el('div', { style: 'display: flex; flex-direction: column; gap: 10px;' });
 
             const reshuffleRow = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
-            reshuffleRow.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: '重新抽取时机' }));
+            reshuffleRow.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: '壁纸轮换方式' }));
             const select = el('select', {
                 style: `background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border: 1px solid ${mix(colors.text, -0.78)}; border-radius: 8px; padding: 5px 8px; font-size: 11.5px;`,
             });
-            [['song', '每次切歌'], ['hour', '每小时'], ['session', '每次启动']].forEach(([value, text]) => {
+            [['song', '每次切歌'], ['media', '按媒体播放'], ['interval', '固定间隔'], ['hour', '每小时'], ['session', '每次启动']].forEach(([value, text]) => {
                 const option = el('option', { text, attrs: { value } });
                 option.value = value;
                 if (settings.reshuffle === value) {
@@ -2956,9 +3016,42 @@ export default function activate(folium) {
             });
             select.addEventListener('change', () => {
                 panelContext.settings.set({ reshuffle: select.value });
+                paint();
             });
             reshuffleRow.append(select);
             box.append(reshuffleRow);
+            const numeric = (label, key, fallback, whole = false) => {
+                const row = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
+                row.append(el('span', { text: label, style: 'font-size: 11.5px;' }));
+                const input = el('input', { attrs: { type: 'number', min: whole ? '1' : '0.1', max: whole ? '1000' : '86400', step: whole ? '1' : '0.1' },
+                    style: `width: 76px; background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border-radius: 8px; padding: 5px 8px;` });
+                input.value = String(settings[key] ?? fallback);
+                input.addEventListener('change', () => {
+                    const value = Number(input.value);
+                    const safe = Number.isFinite(value) && value > 0 ? Math.min(whole ? 1000 : 86400, whole ? Math.max(1, Math.round(value)) : value) : fallback;
+                    input.value = String(safe);
+                    panelContext.settings.set({ [key]: safe });
+                });
+                row.append(input); box.append(row);
+                return row;
+            };
+            const duration = (label, key, unit, fallback) => {
+                const row = numeric(label, key, fallback);
+                const units = el('select', { style: `background: ${mix(colors.text, -0.86)}; color: ${colors.text}; border-radius: 8px; padding: 5px;` });
+                [['seconds', '秒'], ['minutes', '分钟']].forEach(([value, text]) => {
+                    const option = el('option', { text }); option.value = value;
+                    option.selected = (settings[unit] ?? 'minutes') === value; units.append(option);
+                });
+                units.addEventListener('change', () => panelContext.settings.set({ [unit]: units.value }));
+                row.append(units);
+            };
+            if (settings.reshuffle === 'interval') duration('每隔多久更换', 'intervalValue', 'intervalUnit', 5);
+            if (settings.reshuffle === 'media') {
+                numeric('视频完整播放几遍', 'videoPlayCount', 1, true);
+                duration('图片等停留时间', 'imageDurationValue', 'imageDurationUnit', 3);
+                box.append(el('div', { className: 'wp-eng-hint', text: '视频达到播放次数后更换；图片、场景和网页达到停留时间后更换。' }));
+            }
+            box.append(el('div', { className: 'wp-eng-hint', text: '轮换沿用「与播放器同步暂停」设置；切歌仅在「每次切歌」方式下触发更换。' }));
 
             const seedRow = el('div', { className: 'wp-eng-row', style: 'justify-content: space-between;' });
             seedRow.append(el('span', { style: 'font-size: 11.5px; opacity: .85;', text: '随机种子' }));
@@ -2980,11 +3073,11 @@ export default function activate(folium) {
                 panelContext.settings.set({ liveOnly: value });
                 paint();
             }));
-            box.append(liveRow);
+            if ((settings.library ?? 'we') !== 'custom') box.append(liveRow);
 
             box.append(el('div', {
                 className: 'wp-eng-hint',
-                text: `同一首歌 + 同一种子 = 同一张壁纸。当前会从 ${libraryCache?.items?.filter((item) => (settings.liveOnly ? item.live : true)).length ?? 0} 张里抽。`,
+                text: `当前候选 ${(settings.library ?? 'we') === 'custom' ? (customCache?.length ?? 0) : (libraryCache?.items?.filter((item) => settings.liveOnly ? item.live : true).length ?? 0)} 张；轮换时尽量避免连续重复。`,
             }));
             root.append(box);
         };
@@ -3038,7 +3131,7 @@ export default function activate(folium) {
                     }
                     card.append(el('div', {
                         className: 'wp-eng-kind',
-                        text: item.live === 'video' ? '视频' : item.live === 'web' ? '网页' : '场景',
+                        text: item.live === 'video' ? '视频' : item.live === 'web' ? '网页' : item.kind === 'image' ? '图片' : '场景',
                     }));
                     card.append(el('div', { className: 'wp-eng-name', text: item.title }));
                     card.addEventListener('click', () => {
@@ -3077,12 +3170,12 @@ export default function activate(folium) {
             const actions = el('div', { className: 'wp-eng-row' });
             const addImage = el('button', {
                 className: 'wp-eng-btn',
-                text: '添加图片',
+                text: '批量加图片',
                 style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
             });
             const addVideo = el('button', {
                 className: 'wp-eng-btn',
-                text: '添加视频',
+                text: '批量加视频',
                 style: `background: ${mix(colors.text, -0.8)}; color: ${colors.text};`,
             });
             const busy = () => state.busy;
@@ -3095,7 +3188,11 @@ export default function activate(folium) {
                 attrs: { title: 'bmp / svg / ico 等对话框里没有列出的扩展名' },
             });
             addOther.addEventListener('click', () => pickCustom('any'));
-            actions.append(addImage, addVideo, addOther);
+            const addFolder = el('button', { className: 'wp-eng-btn', text: '导入文件夹' });
+            addFolder.addEventListener('click', () => pickCustom('folder'));
+            const addWe = el('button', { className: 'wp-eng-btn', text: '导入 WE 本地文件' });
+            addWe.addEventListener('click', () => pickCustom('we'));
+            actions.append(addImage, addVideo, addFolder, addWe, addOther);
             box.append(actions);
 
             const grid = el('div', { className: 'wp-eng-grid' });
@@ -3106,7 +3203,7 @@ export default function activate(folium) {
             if (entries.length === 0) {
                 grid.append(el('div', {
                     className: 'wp-eng-empty',
-                    text: '还没有添加文件。\n点上面的按钮选图片或视频；它们会作为背景直接铺满播放页。',
+                    text: '可多选文件（Ctrl+A / Ctrl / Shift），或导入整个文件夹；也可以一键导入 WE 已记录的本地文件。',
                 }));
             }
 
@@ -3164,7 +3261,7 @@ export default function activate(folium) {
             root.append(el('div', { className: 'wp-eng-hint', text: modeHint }));
             root.append(el('div', {
                 className: 'wp-eng-hint',
-                text: '图片：PNG / JPG / WebP / GIF / AVIF（「其他格式」还能选 BMP / SVG / ICO / TIFF）；视频：MP4 / M4V / WebM / MOV / MKV（「其他格式」还能选 AVI / WMV / FLV / TS，能否播放取决于浏览器解码器）。文件只按路径引用，移动或删除后需要重新添加。',
+                text: '图片与视频均可多选；文件夹会包含子文件夹。最多保存 4096 项，重复路径会跳过。文件保留在原位置，移动或删除后需要重新添加。',
             }));
         };
 
@@ -3182,20 +3279,21 @@ export default function activate(folium) {
                 state.message = `添加失败：${error && error.message ? error.message : error}`;
             }
             state.busy = false;
-            if (added) {
+            if (added && !added.canceled) {
                 await resolveCustom(true);
-                await writeState({ customId: added.grantId });
-                if (panelContext.settings.get().mode !== 'fixed') {
-                    panelContext.settings.set({ mode: 'fixed' });
+                if (added.firstId) {
+                    await writeState({ customId: added.firstId });
+                    if (panelContext.settings.get().mode !== 'fixed') panelContext.settings.set({ mode: 'fixed' });
                 }
-                state.message = `已添加 ${added.name}`;
+                state.message = `新增 ${added.added} 项，重复 ${added.duplicates} 项，跳过 ${added.skipped} 项；共 ${added.total} 项`;
+                if (added.truncated) state.message += '（达到扫描上限，剩余文件未导入）';
             }
             paint();
         };
 
         const paintDisplayTab = (colors, settings) => {
             const schema = panelContext.settings.schema ?? [];
-            const skipped = new Set(['library', 'mode', 'seed', 'reshuffle', 'liveOnly']);
+            const skipped = new Set(['library', 'mode', 'seed', 'reshuffle', 'liveOnly', 'videoPlayCount', 'intervalValue', 'intervalUnit', 'imageDurationValue', 'imageDurationUnit']);
             const box = el('div', { style: 'display: flex; flex-direction: column; gap: 12px;' });
 
             schema.filter((field) => !skipped.has(field.key)).forEach((field) => {
@@ -3341,6 +3439,8 @@ export default function activate(folium) {
     try {
         folium.rpc.on('ready', () => {
             libraryCache = null;
+            customCache = null;
+            notify();
         });
     } catch {
         /* 非主窗口上下文没有 rpc.on */
